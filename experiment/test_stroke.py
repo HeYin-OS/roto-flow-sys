@@ -91,17 +91,6 @@ def generate_salient_stroke_images(points_stroke_candidates, height, width, i_fr
     cv2.imwrite(file_path, canvas)
 
 
-# all are xy-order
-strokes_flow = [None]
-strokes_snapping = [None]
-strokes_fitted = []
-
-color_origin = (255, 250, 205)  # lemon chiffon
-color_flow = (255, 182, 193)  # light pink
-color_snapping = (251, 250, 129)  # light blue
-color_fitted = (144, 238, 144)  # light green
-
-
 def generate_prediction_strokes(stroke_0: np.ndarray,
                                 images_rgb_nhwc: np.ndarray,
                                 points_all_image_candidates: List[np.ndarray],
@@ -122,58 +111,108 @@ def generate_prediction_strokes(stroke_0: np.ndarray,
     kd_tree_all_candidates = BatchKDTree(points_all_image_candidates)
 
 
-def draw_curves(canvas: np.ndarray):
-    pass
+def rgb_to_bgr(color: tuple):
+    """Convert an RGB tuple/list to BGR order."""
+    return color[::-1]
+
+
+# all are xy-order
+strokes_flow: List = []
+strokes_snapping: List = []
+strokes_fitted: List = []
+
+flag_current_frame: int = 0
+flag_current_test_stroke: int = 0
+
+color_origin = (255, 255, 0)  # Vivid Orange
+color_flow = (200, 130, 255)  # Soft Lavender
+color_snapping = (0, 150, 255)  # Tech Blue
+color_fitted = (50, 200, 50)  # Fresh Green
+
+thickness = 2
+
+
+def draw_curves(canvas: np.ndarray, stroke_origin: np.ndarray):
+    global color_origin, color_flow, color_snapping, color_fitted
+    global thickness, flag_current_frame
+    global strokes_flow, strokes_snapping, strokes_fitted
+
+    # print(stroke_origin)
+    # print(f"stroke origin shape: {stroke_origin.shape}, dtype:{stroke_origin.dtype}")
+
+    # the input original stroke
+    cv2.polylines(canvas, [stroke_origin], False, rgb_to_bgr(color_origin), thickness, lineType=cv2.LINE_AA)
+
+    # pure optical flow stroke
+    if strokes_flow[flag_current_frame] is not None:
+        cv2.polylines(canvas, [strokes_flow[flag_current_frame]], False, rgb_to_bgr(color_flow), thickness, lineType=cv2.LINE_AA)
+
+    # pure snapped stroke
+    if strokes_fitted[flag_current_frame] is not None:
+        cv2.polylines(canvas, [strokes_snapping[flag_current_frame]], False, rgb_to_bgr(color_snapping), thickness, lineType=cv2.LINE_AA)
+
+    # fitted stroke
+    if strokes_fitted[flag_current_frame] is not None:
+        cv2.polylines(canvas, [strokes_fitted[flag_current_frame]], False, rgb_to_bgr(color_fitted), thickness, lineType=cv2.LINE_AA)
+
+
+def init_stroke_system(n_frame: int):
+    global strokes_flow, strokes_snapping, strokes_fitted
+
+    strokes_flow = []
+    strokes_snapping = []
+    strokes_fitted = []
+
+    for i_frame in range(n_frame):
+        strokes_flow.append(None)
+        strokes_snapping.append(None)
+        strokes_fitted.append(None)
 
 
 def main():
     EdgeSnappingConfig.load("../config/snapping_init.yaml")
-
     strokes_test = read_strokes()
 
     frame_image_paths = get_frame_image_paths()
 
-    # [N, H, W, C] (RGB), val w.r.t. [0, 1]
-    images_rgb_nhwc = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
+    # [N, H, W, C] (RGB), val w.r.t. [0, 255]
+    images_rgb_nhwc_uint8 = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
+    n_frame = images_rgb_nhwc_uint8.shape[0]
+    init_stroke_system(n_frame)
 
     # [N-1, H, W, 2] equal to [num of consecutive two frames, height, width, x and y]
-    flow_nhw2 = read_optical_flow_cache().numpy()
-    print(f"Loaded optical flow cache: {flow_nhw2.shape}, {flow_nhw2.dtype}")
+    flow_nhw2_float32 = read_optical_flow_cache().numpy()
+    print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
 
-    points_all_candidates = compute_all_candidates(images_rgb_nhwc)
+    points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
 
-    # TODO: interactive viewing system by cv2
-    n_frame = images_rgb_nhwc.shape[0]
-    H = images_rgb_nhwc.shape[1]
-    W = images_rgb_nhwc.shape[2]
-
-    flag_current_frame: int = 0
-    flag_current_test_stroke: int = 0
-
-    # generate_prediction_strokes()
-
+    # make fitted stroke on frame 0
+    global strokes_fitted, flag_current_frame
     kd_tree_groups = BatchKDTree(points_all_candidates)
-
-    points_stroke_candidate = kd_tree_groups.query_batch(0, strokes_test[0], EdgeSnappingConfig.r_s)
-
-    stroke_snapped = local_snapping(strokes_test[0], images_rgb_nhwc[0], points_stroke_candidate)
+    points_stroke_candidate = kd_tree_groups.query_batch(0, strokes_test[flag_current_test_stroke],
+                                                         EdgeSnappingConfig.r_s)
+    stroke_0_snapped = local_snapping(strokes_test[flag_current_test_stroke],
+                                      images_rgb_nhwc_uint8[0],
+                                      points_stroke_candidate)
+    strokes_fitted[0] = stroke_0_snapped.astype(np.int32)
 
     # use A D to switch frames
-    # while True:
-    #     # acquire input key
-    #     key = cv2.waitKey(1) & 0xFF
-    #     if key == ord('a'):
-    #         if flag_current_frame > 0:
-    #             flag_current_frame = flag_current_frame - 1
-    #     if key == ord('d'):
-    #         if flag_current_frame < n_frame - 1:
-    #             flag_current_frame = flag_current_frame + 1
-    #     if key == ord('q'):
-    #         break
-    #
-    #     canvas = cv2.cvtColor(images_rgb_nhwc[flag_current_frame], cv2.COLOR_RGB2BGR)
-    #
-    #     cv2.imshow(target_name, canvas)
+    while True:
+        # acquire input key
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('a'):
+            if flag_current_frame > 0:
+                flag_current_frame = flag_current_frame - 1
+        if key == ord('d'):
+            if flag_current_frame < n_frame - 1:
+                flag_current_frame = flag_current_frame + 1
+        if key == ord('q'):
+            break
+
+        canvas = cv2.cvtColor(images_rgb_nhwc_uint8[flag_current_frame], cv2.COLOR_RGB2BGR)
+        draw_curves(canvas, strokes_test[flag_current_test_stroke])
+
+        cv2.imshow(target_name, canvas)
 
     # TODO: flow + candidates + stroke -> prediction curve
 

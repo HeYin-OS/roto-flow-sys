@@ -46,14 +46,14 @@ def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
     return dog_kernel
 
 
-def compute_all_candidates(images_rgb_nhwc: np.ndarray):
+def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
     out = []
-    for i_frame in tqdm(range(images_rgb_nhwc.shape[0]), desc="Computing candidate points", unit=" image(s)"):
-        image_np_gray = cv2.cvtColor(images_rgb_nhwc[i_frame], cv2.COLOR_RGB2GRAY)
+    for i_frame in tqdm(range(images_rgb_nhwc_uint8.shape[0]), desc="Computing candidate points", unit=" image(s)"):
+        image_gray_hw_uint8 = cv2.cvtColor(images_rgb_nhwc_uint8[i_frame], cv2.COLOR_RGB2GRAY)
 
         # gradient magnitude
-        gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
-        gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        gx = cv2.Sobel(image_gray_hw_uint8, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        gy = cv2.Sobel(image_gray_hw_uint8, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
         mag = cv2.magnitude(gx, gy)
 
         # normalization
