@@ -229,7 +229,7 @@ def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
 
 
 def main():
-    global flag_current_frame, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
+    global flag_current_frame, flag_current_test_stroke, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
     EdgeSnappingConfig.load("../config/snapping_init.yaml")
     strokes_test = read_strokes()
 
@@ -272,6 +272,16 @@ def main():
             is_visible_snapping = not is_visible_snapping
         elif key == ord('v'):
             is_visible_fitted = not is_visible_fitted
+        elif key == ord('1') or key == ord('2') or key == ord('3'):
+            i_test = key - ord('1')
+            if i_test != flag_current_test_stroke:
+                flag_current_test_stroke = i_tested
+                propagate_strokes_with_snapping_flow(flow_nhw2_float32,
+                                                     images_rgb_nhwc_uint8,
+                                                     kd_tree_groups,
+                                                     n_frame,
+                                                     strokes_test[flag_current_test_stroke])
+
         elif key == ord('q'):
             break
 
