@@ -1,0 +1,15 @@
+snapping:
+  theta: 0.25
+  alpha: 0.1
+  beta: 0.5
+  beta_shift: 0.25
+  sigma_c: 1.0
+  sigma_s: 1.6
+  sigma_m: 3.0
+  rho: 0.99
+  x: 4
+  y: 7
+  r_s: 20
+  candidate_num: 4
+  sampling_num: 100
+  average_weight_threshold: 0.07

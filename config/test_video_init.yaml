@@ -1,0 +1,3 @@
+video:
+  url_head: "./test/images/bear"
+  format: jpg
