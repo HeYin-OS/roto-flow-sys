@@ -72,7 +72,7 @@ def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
 
         # all candidate points on this frame
         ys, xs = np.nonzero(local_max)
-        out.append(np.stack([xs, ys], axis=1))
+        out.append(np.stack([xs, ys], axis=1).astype(np.float32))
     return out
 
 
@@ -165,8 +165,6 @@ def local_snapping(stroke: np.ndarray,
 
     # accumulated energy for first candidate group is zero
     energy[flatten_index_ptr[0]: flatten_index_ptr[1]] = 0.0
-
-    # TODO: correct the xy-error, tensor format error, and 255 0-1 error
 
     for i_group in range(stroke_len - 1):
         # get a candidate group of i, i+1 from flatten slice

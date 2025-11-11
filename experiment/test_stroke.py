@@ -4,7 +4,6 @@ from typing import List, Any
 import cv2
 import numpy as np
 import torch
-from torch import candidate
 from torch import Tensor
 from tqdm import tqdm
 
@@ -36,7 +35,7 @@ def read_strokes() -> List[np.ndarray]:
     for i in range(1, 100):
         path = stroke_path_head + f"{i:02d}" + ".npy"
         if os.path.exists(path):
-            out.append(np.load(path))
+            out.append(np.load(path).astype(np.float32))
             print(f"Loaded stroke from:  {path}")
         else:
             # print(f"{path} does not exist")
@@ -91,24 +90,63 @@ def generate_salient_stroke_images(points_stroke_candidates, height, width, i_fr
     cv2.imwrite(file_path, canvas)
 
 
-def generate_prediction_strokes(stroke_0: np.ndarray,
-                                images_rgb_nhwc: np.ndarray,
-                                points_all_image_candidates: List[np.ndarray],
-                                flow_nhw2: np.ndarray):
-    # clear prediction history
+def generate_prediction_stroke_on_0(stroke_0: np.ndarray,
+                                    images_rgb_nhwc_uint8: np.ndarray,
+                                    kd_tree_groups: BatchKDTree):
+    """Generate prediction stroke on frame 0 using edge snapping"""
+    global strokes_fitted, flag_current_frame
+    points_stroke_candidate = kd_tree_groups.query_batch(0,
+                                                         stroke_0,
+                                                         EdgeSnappingConfig.r_s)
+    stroke_0_snapped = local_snapping(stroke_0,
+                                      images_rgb_nhwc_uint8[0],
+                                      points_stroke_candidate)
+    strokes_fitted[0] = stroke_0_snapped.astype(np.float32)
+
+
+def generate_prediction_strokes_subsequent(images_rgb_nhwc: np.ndarray,
+                                           kd_tree_groups: BatchKDTree,
+                                           flow_nhw2: np.ndarray):
+    """Generate prediction strokes from frame 1 (0 as start) to frame n-1 using edge snapping and optical flow"""
     global strokes_flow, strokes_snapping, strokes_fitted
 
-    strokes_flow = [None]
-    strokes_snapping = [None]
-    strokes_fitted = []
+    for i in tqdm(range(images_rgb_nhwc.shape[0] - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch"):
+        i_frame = i + 1
 
-    # fit the curve on frame 0
-    stroke_0_fitted = local_snapping(stroke_0, images_rgb_nhwc, points_all_image_candidates)
-    strokes_fitted.append(stroke_0_fitted)
+        stroke_copied = strokes_fitted[i_frame - 1]
+        points_stroke_candidate = kd_tree_groups.query_batch(i_frame,
+                                                             stroke_copied,
+                                                             EdgeSnappingConfig.r_s)
 
-    # kd-tree
+        # pure edge snapping strokes
+        stroke_snapping = None
+        if i == 0:
+            stroke_snapping = local_snapping(stroke_copied,
+                                             images_rgb_nhwc[i_frame],
+                                             points_stroke_candidate)
+        else:
+            stroke_snapping = local_snapping(strokes_snapping[i_frame - 1],
+                                             images_rgb_nhwc[i_frame],
+                                             points_stroke_candidate)
+        strokes_snapping[i_frame] = stroke_snapping
 
-    kd_tree_all_candidates = BatchKDTree(points_all_image_candidates)
+        # pure optical flow strokes
+        stroke_flow = None
+        if i == 0:
+            x, y = stroke_copied[:, 0], stroke_copied[:, 1]
+            stroke_flow = stroke_copied + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
+        else:
+            x, y = strokes_flow[i_frame - 1][:, 0], strokes_flow[i_frame - 1][:, 1]
+            stroke_flow = strokes_flow[i_frame - 1] + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
+        strokes_flow[i_frame] = stroke_flow
+
+        # real propagated strokes
+        x, y = stroke_copied[:, 0], stroke_copied[:, 1]
+        stroke_fitted = stroke_copied + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
+        stroke_fitted = local_snapping(stroke_fitted,
+                                       images_rgb_nhwc[i_frame],
+                                       points_stroke_candidate)
+        strokes_fitted[i_frame] = stroke_fitted
 
 
 def rgb_to_bgr(color: tuple):
@@ -124,6 +162,11 @@ strokes_fitted: List = []
 flag_current_frame: int = 0
 flag_current_test_stroke: int = 0
 
+is_visible_origin: bool = True
+is_visible_flow: bool = False
+is_visible_snapping: bool = False
+is_visible_fitted: bool = True
+
 color_origin = (255, 255, 0)  # Vivid Orange
 color_flow = (200, 130, 255)  # Soft Lavender
 color_snapping = (0, 150, 255)  # Tech Blue
@@ -136,24 +179,26 @@ def draw_curves(canvas: np.ndarray, stroke_origin: np.ndarray):
     global color_origin, color_flow, color_snapping, color_fitted
     global thickness, flag_current_frame
     global strokes_flow, strokes_snapping, strokes_fitted
+    global is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
 
     # print(stroke_origin)
     # print(f"stroke origin shape: {stroke_origin.shape}, dtype:{stroke_origin.dtype}")
 
     # the input original stroke
-    cv2.polylines(canvas, [stroke_origin], False, rgb_to_bgr(color_origin), thickness, lineType=cv2.LINE_AA)
+    if is_visible_origin:
+        cv2.polylines(canvas, [stroke_origin.astype(np.int32)], False, rgb_to_bgr(color_origin), thickness, lineType=cv2.LINE_AA)
 
     # pure optical flow stroke
-    if strokes_flow[flag_current_frame] is not None:
-        cv2.polylines(canvas, [strokes_flow[flag_current_frame]], False, rgb_to_bgr(color_flow), thickness, lineType=cv2.LINE_AA)
+    if strokes_flow[flag_current_frame] is not None and is_visible_flow:
+        cv2.polylines(canvas, [strokes_flow[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_flow), thickness, lineType=cv2.LINE_AA)
 
     # pure snapped stroke
-    if strokes_fitted[flag_current_frame] is not None:
-        cv2.polylines(canvas, [strokes_snapping[flag_current_frame]], False, rgb_to_bgr(color_snapping), thickness, lineType=cv2.LINE_AA)
+    if strokes_snapping[flag_current_frame] is not None and is_visible_snapping:
+        cv2.polylines(canvas, [strokes_snapping[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_snapping), thickness, lineType=cv2.LINE_AA)
 
     # fitted stroke
-    if strokes_fitted[flag_current_frame] is not None:
-        cv2.polylines(canvas, [strokes_fitted[flag_current_frame]], False, rgb_to_bgr(color_fitted), thickness, lineType=cv2.LINE_AA)
+    if strokes_fitted[flag_current_frame] is not None and is_visible_fitted:
+        cv2.polylines(canvas, [strokes_fitted[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_fitted), thickness, lineType=cv2.LINE_AA)
 
 
 def init_stroke_system(n_frame: int):
@@ -169,7 +214,22 @@ def init_stroke_system(n_frame: int):
         strokes_fitted.append(None)
 
 
+def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
+                                         images_rgb_nhwc_uint8: np.ndarray,
+                                         kd_tree_groups: BatchKDTree,
+                                         n_frame: int,
+                                         strokes_0: np.ndarray):
+    init_stroke_system(n_frame)
+    generate_prediction_stroke_on_0(strokes_0,
+                                    images_rgb_nhwc_uint8,
+                                    kd_tree_groups)
+    generate_prediction_strokes_subsequent(images_rgb_nhwc_uint8,
+                                           kd_tree_groups,
+                                           flow_nhw2_float32)
+
+
 def main():
+    global flag_current_frame, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
     EdgeSnappingConfig.load("../config/snapping_init.yaml")
     strokes_test = read_strokes()
 
@@ -177,44 +237,48 @@ def main():
 
     # [N, H, W, C] (RGB), val w.r.t. [0, 255]
     images_rgb_nhwc_uint8 = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
-    n_frame = images_rgb_nhwc_uint8.shape[0]
-    init_stroke_system(n_frame)
 
-    # [N-1, H, W, 2] equal to [num of consecutive two frames, height, width, x and y]
+    # [N-1, H, W, 2] float
     flow_nhw2_float32 = read_optical_flow_cache().numpy()
     print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
 
+    # stroke prediction workflow
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
-
-    # make fitted stroke on frame 0
-    global strokes_fitted, flag_current_frame
     kd_tree_groups = BatchKDTree(points_all_candidates)
-    points_stroke_candidate = kd_tree_groups.query_batch(0, strokes_test[flag_current_test_stroke],
-                                                         EdgeSnappingConfig.r_s)
-    stroke_0_snapped = local_snapping(strokes_test[flag_current_test_stroke],
-                                      images_rgb_nhwc_uint8[0],
-                                      points_stroke_candidate)
-    strokes_fitted[0] = stroke_0_snapped.astype(np.int32)
+    n_frame = images_rgb_nhwc_uint8.shape[0]
+    propagate_strokes_with_snapping_flow(flow_nhw2_float32,
+                                         images_rgb_nhwc_uint8,
+                                         kd_tree_groups,
+                                         n_frame,
+                                         strokes_test[flag_current_test_stroke])
 
     # use A D to switch frames
+    # z x c d to switch stroke visibility
+    # 1 2 3 to switch tested stroke index
     while True:
         # acquire input key
         key = cv2.waitKey(1) & 0xFF
         if key == ord('a'):
             if flag_current_frame > 0:
                 flag_current_frame = flag_current_frame - 1
-        if key == ord('d'):
+        elif key == ord('d'):
             if flag_current_frame < n_frame - 1:
                 flag_current_frame = flag_current_frame + 1
-        if key == ord('q'):
+        elif key == ord('z'):
+            is_visible_origin = not is_visible_origin
+        elif key == ord('x'):
+            is_visible_flow = not is_visible_flow
+        elif key == ord('c'):
+            is_visible_snapping = not is_visible_snapping
+        elif key == ord('v'):
+            is_visible_fitted = not is_visible_fitted
+        elif key == ord('q'):
             break
 
         canvas = cv2.cvtColor(images_rgb_nhwc_uint8[flag_current_frame], cv2.COLOR_RGB2BGR)
         draw_curves(canvas, strokes_test[flag_current_test_stroke])
 
         cv2.imshow(target_name, canvas)
-
-    # TODO: flow + candidates + stroke -> prediction curve
 
 
 if __name__ == '__main__':
