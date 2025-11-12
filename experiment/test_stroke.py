@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -9,54 +10,145 @@ from tqdm import tqdm
 
 from utils.edge_snapping import compute_all_candidates, EdgeSnappingConfig, local_snapping
 from utils.kd_tree import BatchKDTree
-from utils.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-CONFIG_DIR = BASE_DIR / "config"
-CACHE_DIR = BASE_DIR / "caches"
-STROKE_DIR = BASE_DIR / "stroke"
-DEBUG_DIR = BASE_DIR / "debug"
-
-_config_path = CONFIG_DIR / "test_video_init.yaml"
-path_head_raw = YamlUtil.read(str(_config_path))['video']['url_head']
-path_head = Path(path_head_raw)
-if not path_head.is_absolute():
-    path_head = (BASE_DIR / path_head).resolve()
-else:
-    path_head = path_head.resolve()
-
-target_name = path_head.name
-stroke_save_folder_path = STROKE_DIR / target_name
-
-print(f"tracing target: {target_name}")
-print(f"frame images folder: {path_head}")
+COLOR_ORIGIN = (255, 255, 0)  # Vivid Orange
+COLOR_FLOW = (200, 130, 255)  # Soft Lavender
+COLOR_SNAPPING = (0, 150, 255)  # Tech Blue
+COLOR_FITTED = (50, 200, 50)  # Fresh Green
+THICKNESS = 2
 
 
-def get_frame_image_paths():
-    paths = sorted(
-        path for path in path_head.iterdir()
+@dataclass(frozen=True)
+class ProjectPaths:
+    base: Path
+    config: Path
+    cache: Path
+    stroke: Path
+    debug: Path
+
+
+@dataclass(frozen=True)
+class StrokeEnvironment:
+    paths: ProjectPaths
+    frame_dir: Path
+    target_name: str
+
+    @property
+    def stroke_dir(self) -> Path:
+        return self.paths.stroke / self.target_name
+
+    @property
+    def cache_file(self) -> Path:
+        return self.paths.cache / f"{self.target_name}.pt"
+
+    @property
+    def salient_dir(self) -> Path:
+        return self.paths.debug / "salient" / self.target_name
+
+    @property
+    def salient_stroke_dir(self) -> Path:
+        return self.paths.debug / "salient_stroke" / self.target_name
+
+
+@dataclass
+class ViewerState:
+    current_frame: int = 0
+    current_stroke_index: int = 0
+    show_origin: bool = True
+    show_flow: bool = False
+    show_snapping: bool = False
+    show_fitted: bool = True
+
+
+@dataclass
+class StrokeBuffers:
+    flow: List[np.ndarray | None] = field(default_factory=list)
+    snapping: List[np.ndarray | None] = field(default_factory=list)
+    fitted: List[np.ndarray | None] = field(default_factory=list)
+
+    def reset(self, n_frame: int) -> None:
+        self.flow = [None] * n_frame
+        self.snapping = [None] * n_frame
+        self.fitted = [None] * n_frame
+
+
+@dataclass
+class StrokeData:
+    images_rgb: np.ndarray
+    flow_nhw2: np.ndarray
+    kd_tree: BatchKDTree
+
+
+@dataclass
+class RuntimeContext:
+    env: StrokeEnvironment
+    data: StrokeData
+    strokes_library: List[np.ndarray]
+    buffers: StrokeBuffers
+    viewer: ViewerState
+
+
+class KeyHandlerRegistry:
+    def __init__(self) -> None:
+        self._handlers: Dict[int, Callable[[], bool]] = {}
+
+    def register(self, key_char: str) -> Callable[[Callable[[], bool]], Callable[[], bool]]:
+        def decorator(func: Callable[[], bool]) -> Callable[[], bool]:
+            self._handlers[ord(key_char)] = func
+            return func
+
+        return decorator
+
+    def dispatch(self, key_code: int) -> bool:
+        handler = self._handlers.get(key_code)
+        return handler() if handler else False
+
+
+def build_project_paths() -> ProjectPaths:
+    base = Path(__file__).resolve().parent.parent
+    return ProjectPaths(
+        base=base,
+        config=base / "config",
+        cache=base / "caches",
+        stroke=base / "stroke",
+        debug=base / "debug",
+    )
+
+
+def load_environment() -> StrokeEnvironment:
+    paths = build_project_paths()
+    config_path = paths.config / "test_video_init.yaml"
+    config_data = YamlUtil.read(str(config_path))
+    frame_dir_raw = Path(config_data['video']['url_head'])
+    frame_dir = (paths.base / frame_dir_raw).resolve() if not frame_dir_raw.is_absolute() else frame_dir_raw.resolve()
+    return StrokeEnvironment(
+        paths=paths,
+        frame_dir=frame_dir,
+        target_name=frame_dir.name,
+    )
+
+
+def get_frame_image_paths(env: StrokeEnvironment) -> List[Path]:
+    return sorted(
+        path for path in env.frame_dir.iterdir()
         if path.suffix.lower() in (".jpg", ".png")
     )
-    return paths
 
 
-def read_strokes() -> List[np.ndarray]:
-    stroke_save_folder_path.mkdir(parents=True, exist_ok=True)
-    out = []
+def read_strokes(env: StrokeEnvironment) -> List[np.ndarray]:
+    env.stroke_dir.mkdir(parents=True, exist_ok=True)
+    strokes: List[np.ndarray] = []
     for i in range(1, 100):
-        path = stroke_save_folder_path / f"stroke_{i:02d}.npy"
-        if path.exists():
-            out.append(np.load(str(path)).astype(np.float32))
-            print(f"Loaded stroke from:  {path}")
-        else:
-            # print(f"{path} does not exist")
+        path = env.stroke_dir / f"stroke_{i:02d}.npy"
+        if not path.exists():
             break
-    return out
+        strokes.append(np.load(str(path)).astype(np.float32))
+        print(f"Loaded stroke from:  {path}")
+    return strokes
 
 
-def read_images_batch(paths: List[Path], flag: Any):
+def read_images_batch(paths: List[Path], flag: Any) -> np.ndarray:
     out = []
     for i_path in tqdm(range(len(paths)), desc="Reading images:", unit=" image(s)"):
         img = cv2.imread(str(paths[i_path]), flag)
@@ -64,302 +156,244 @@ def read_images_batch(paths: List[Path], flag: Any):
     return np.stack(out)
 
 
-def read_optical_flow_cache() -> Tensor | None:
-    cache_path = CACHE_DIR / f"{target_name}.pt"
+def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
+    cache_path = env.cache_file
     if cache_path.exists():
         return torch.load(str(cache_path))
-    else:
-        raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
+    raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
 
 
-def generate_salient_images(points_all_candidates, height, width):
+def generate_salient_images(env: StrokeEnvironment, points_all_candidates, height: int, width: int) -> None:
     for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
         canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
-        work_dir = DEBUG_DIR / "salient" / target_name
+        work_dir = env.salient_dir
         work_dir.mkdir(parents=True, exist_ok=True)
         file_path = work_dir / f"{i_img:03d}.jpg"
         cv2.imwrite(str(file_path), canvas)
 
 
-def generate_salient_stroke_images(points_stroke_candidates, height, width, i_frame):
+def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates, height: int, width: int, i_frame: int) -> None:
     canvas = np.zeros((height, width), np.uint8)
     for i_group in range(len(points_stroke_candidates)):
         canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
-    work_dir = DEBUG_DIR / "salient_stroke" / target_name
+    work_dir = env.salient_stroke_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     file_path = work_dir / f"{i_frame:03d}.jpg"
     cv2.imwrite(str(file_path), canvas)
 
 
-def generate_prediction_stroke_on_0(stroke_0: np.ndarray,
-                                    images_rgb_nhwc_uint8: np.ndarray,
-                                    kd_tree_groups: BatchKDTree):
-    """Generate prediction stroke on frame 0 using edge snapping"""
-    global strokes_fitted, flag_current_frame
-    points_stroke_candidate = kd_tree_groups.query_batch(0,
-                                                         stroke_0,
-                                                         EdgeSnappingConfig.r_s)
-    stroke_0_snapped = local_snapping(stroke_0,
-                                      images_rgb_nhwc_uint8[0],
-                                      points_stroke_candidate)
-    strokes_fitted[0] = stroke_0_snapped.astype(np.float32)
-
-
-def generate_prediction_strokes_subsequent(images_rgb_nhwc: np.ndarray,
-                                           kd_tree_groups: BatchKDTree,
-                                           flow_nhw2: np.ndarray):
-    """Generate prediction strokes from frame 1 (0 as start) to frame n-1 using edge snapping and optical flow"""
-    global strokes_flow, strokes_snapping, strokes_fitted
-
-    for i in tqdm(range(images_rgb_nhwc.shape[0] - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch"):
-        i_frame = i + 1
-
-        stroke_copied = strokes_fitted[i_frame - 1]
-        points_stroke_candidate = kd_tree_groups.query_batch(i_frame,
-                                                             stroke_copied,
-                                                             EdgeSnappingConfig.r_s)
-
-        # pure edge snapping strokes
-        stroke_snapping = None
-        if i == 0:
-            stroke_snapping = local_snapping(stroke_copied,
-                                             images_rgb_nhwc[i_frame],
-                                             points_stroke_candidate)
-        else:
-            stroke_snapping = local_snapping(strokes_snapping[i_frame - 1],
-                                             images_rgb_nhwc[i_frame],
-                                             points_stroke_candidate)
-        strokes_snapping[i_frame] = stroke_snapping
-
-        # pure optical flow strokes
-        stroke_flow = None
-        if i == 0:
-            x, y = stroke_copied[:, 0], stroke_copied[:, 1]
-            stroke_flow = stroke_copied + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
-        else:
-            x, y = strokes_flow[i_frame - 1][:, 0], strokes_flow[i_frame - 1][:, 1]
-            stroke_flow = strokes_flow[i_frame - 1] + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
-        strokes_flow[i_frame] = stroke_flow
-
-        # real propagated strokes
-        x, y = stroke_copied[:, 0], stroke_copied[:, 1]
-        stroke_fitted = stroke_copied + flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
-        stroke_fitted = local_snapping(stroke_fitted,
-                                       images_rgb_nhwc[i_frame],
-                                       points_stroke_candidate)
-        strokes_fitted[i_frame] = stroke_fitted
-
-
-def rgb_to_bgr(color: tuple):
+def rgb_to_bgr(color: tuple) -> tuple:
     """Convert an RGB tuple/list to BGR order."""
     return color[::-1]
 
 
-# all are xy-order
-strokes_flow: List = []
-strokes_snapping: List = []
-strokes_fitted: List = []
-
-flag_current_frame: int = 0
-flag_current_test_stroke: int = 0
-
-is_visible_origin: bool = True
-is_visible_flow: bool = False
-is_visible_snapping: bool = False
-is_visible_fitted: bool = True
-
-color_origin = (255, 255, 0)  # Vivid Orange
-color_flow = (200, 130, 255)  # Soft Lavender
-color_snapping = (0, 150, 255)  # Tech Blue
-color_fitted = (50, 200, 50)  # Fresh Green
-
-thickness = 2
-
-# Global references for handlers
-images_rgb_nhwc_uint8_global: np.ndarray | None = None
-flow_nhw2_float32_global: np.ndarray | None = None
-kd_tree_groups_global: BatchKDTree | None = None
-strokes_test_global: List[np.ndarray] = []
-n_frame_global: int = 0
+def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, stroke_0: np.ndarray) -> None:
+    points_stroke_candidate = data.kd_tree.query_batch(
+        0,
+        stroke_0,
+        EdgeSnappingConfig.r_s,
+    )
+    stroke_0_snapped = local_snapping(
+        stroke_0,
+        data.images_rgb[0],
+        points_stroke_candidate,
+    )
+    buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
 
-def draw_curves(canvas: np.ndarray, stroke_origin: np.ndarray):
-    global color_origin, color_flow, color_snapping, color_fitted
-    global thickness, flag_current_frame
-    global strokes_flow, strokes_snapping, strokes_fitted
-    global is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
+def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeData) -> None:
+    for i in tqdm(range(data.images_rgb.shape[0] - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch"):
+        i_frame = i + 1
 
-    # print(stroke_origin)
-    # print(f"stroke origin shape: {stroke_origin.shape}, dtype:{stroke_origin.dtype}")
+        stroke_copied = buffers.fitted[i_frame - 1]
+        if stroke_copied is None:
+            raise RuntimeError(f"Missing fitted stroke for frame {i_frame - 1}")
 
-    # the input original stroke
-    if is_visible_origin:
-        cv2.polylines(canvas, [stroke_origin.astype(np.int32)], False, rgb_to_bgr(color_origin), thickness, lineType=cv2.LINE_AA)
+        points_stroke_candidate = data.kd_tree.query_batch(
+            i_frame,
+            stroke_copied,
+            EdgeSnappingConfig.r_s,
+        )
 
-    # pure optical flow stroke
-    if strokes_flow[flag_current_frame] is not None and is_visible_flow:
-        cv2.polylines(canvas, [strokes_flow[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_flow), thickness, lineType=cv2.LINE_AA)
+        if i == 0 or buffers.snapping[i_frame - 1] is None:
+            previous_snapping = stroke_copied
+        else:
+            previous_snapping = buffers.snapping[i_frame - 1]
+        stroke_snapping = local_snapping(
+            previous_snapping,
+            data.images_rgb[i_frame],
+            points_stroke_candidate,
+        )
+        buffers.snapping[i_frame] = stroke_snapping
 
-    # pure snapped stroke
-    if strokes_snapping[flag_current_frame] is not None and is_visible_snapping:
-        cv2.polylines(canvas, [strokes_snapping[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_snapping), thickness, lineType=cv2.LINE_AA)
+        if i == 0 or buffers.flow[i_frame - 1] is None:
+            x, y = stroke_copied[:, 0], stroke_copied[:, 1]
+            previous_flow = stroke_copied
+        else:
+            previous_flow = buffers.flow[i_frame - 1]
+            x, y = previous_flow[:, 0], previous_flow[:, 1]
+        stroke_flow = previous_flow + data.flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
+        buffers.flow[i_frame] = stroke_flow
 
-    # fitted stroke
-    if strokes_fitted[flag_current_frame] is not None and is_visible_fitted:
-        cv2.polylines(canvas, [strokes_fitted[flag_current_frame].astype(np.int32)], False, rgb_to_bgr(color_fitted), thickness, lineType=cv2.LINE_AA)
-
-
-def init_stroke_system(n_frame: int):
-    global strokes_flow, strokes_snapping, strokes_fitted
-
-    strokes_flow = []
-    strokes_snapping = []
-    strokes_fitted = []
-
-    for i_frame in range(n_frame):
-        strokes_flow.append(None)
-        strokes_snapping.append(None)
-        strokes_fitted.append(None)
+        x_fit, y_fit = stroke_copied[:, 0], stroke_copied[:, 1]
+        stroke_fitted = stroke_copied + data.flow_nhw2[i_frame - 1, y_fit.astype(np.int32), x_fit.astype(np.int32)]
+        stroke_fitted = local_snapping(
+            stroke_fitted,
+            data.images_rgb[i_frame],
+            points_stroke_candidate,
+        )
+        buffers.fitted[i_frame] = stroke_fitted
 
 
-def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
-                                         images_rgb_nhwc_uint8: np.ndarray,
-                                         kd_tree_groups: BatchKDTree,
-                                         n_frame: int,
-                                         strokes_0: np.ndarray):
-    init_stroke_system(n_frame)
-    generate_prediction_stroke_on_0(strokes_0,
-                                    images_rgb_nhwc_uint8,
-                                    kd_tree_groups)
-    generate_prediction_strokes_subsequent(images_rgb_nhwc_uint8,
-                                           kd_tree_groups,
-                                           flow_nhw2_float32)
+def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffers, stroke_initial: np.ndarray) -> None:
+    n_frame = data.images_rgb.shape[0]
+    buffers.reset(n_frame)
+    buffers.flow[0] = None
+    buffers.snapping[0] = None
+    buffers.fitted[0] = None
+    generate_prediction_stroke_on_0(buffers, data, stroke_initial)
+    generate_prediction_strokes_subsequent(buffers, data)
+
+
+def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
+    state = context.viewer
+    buffers = context.buffers
+
+    stroke_origin = context.strokes_library[state.current_stroke_index]
+
+    if state.show_origin:
+        cv2.polylines(canvas, [stroke_origin.astype(np.int32)], False, rgb_to_bgr(COLOR_ORIGIN), THICKNESS, lineType=cv2.LINE_AA)
+
+    stroke_flow = buffers.flow[state.current_frame]
+    if stroke_flow is not None and state.show_flow:
+        cv2.polylines(canvas, [stroke_flow.astype(np.int32)], False, rgb_to_bgr(COLOR_FLOW), THICKNESS, lineType=cv2.LINE_AA)
+
+    stroke_snapping = buffers.snapping[state.current_frame]
+    if stroke_snapping is not None and state.show_snapping:
+        cv2.polylines(canvas, [stroke_snapping.astype(np.int32)], False, rgb_to_bgr(COLOR_SNAPPING), THICKNESS, lineType=cv2.LINE_AA)
+
+    stroke_fitted = buffers.fitted[state.current_frame]
+    if stroke_fitted is not None and state.show_fitted:
+        cv2.polylines(canvas, [stroke_fitted.astype(np.int32)], False, rgb_to_bgr(COLOR_FITTED), THICKNESS, lineType=cv2.LINE_AA)
+
+
+def propagate_current_stroke(context: RuntimeContext) -> None:
+    stroke = context.strokes_library[context.viewer.current_stroke_index]
+    propagate_strokes_with_snapping_flow(context.data, context.buffers, stroke)
+
+
+def build_runtime_context() -> RuntimeContext:
+    env = load_environment()
+    print(f"tracing target: {env.target_name}")
+    print(f"frame images folder: {env.frame_dir}")
+
+    EdgeSnappingConfig.load(str(env.paths.config / "snapping_init.yaml"))
+
+    strokes_library = read_strokes(env)
+    if not strokes_library:
+        raise RuntimeError(f"No stroke files found in {env.stroke_dir}")
+
+    frame_image_paths = get_frame_image_paths(env)
+    if not frame_image_paths:
+        raise RuntimeError(f"No frame images found in {env.frame_dir}")
+
+    images_rgb_nhwc_uint8 = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
+
+    flow_tensor = read_optical_flow_cache(env)
+    flow_nhw2_float32 = flow_tensor.numpy()
+    print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
+
+    points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
+    generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+    kd_tree_groups = BatchKDTree(points_all_candidates)
+
+    data = StrokeData(
+        images_rgb=images_rgb_nhwc_uint8,
+        flow_nhw2=flow_nhw2_float32,
+        kd_tree=kd_tree_groups,
+    )
+
+    buffers = StrokeBuffers()
+    viewer = ViewerState()
+
+    context = RuntimeContext(
+        env=env,
+        data=data,
+        strokes_library=strokes_library,
+        buffers=buffers,
+        viewer=viewer,
+    )
+
+    propagate_current_stroke(context)
+    return context
 
 
 def main():
-    global images_rgb_nhwc_uint8_global
-    global flow_nhw2_float32_global
-    global kd_tree_groups_global
-    global strokes_test_global
-    global n_frame_global
-    global flag_current_frame
-    global flag_current_test_stroke
-    global is_visible_origin
-    global is_visible_flow
-    global is_visible_snapping
-    global is_visible_fitted
-    EdgeSnappingConfig.load(str(CONFIG_DIR / "snapping_init.yaml"))
-    strokes_test = read_strokes()
+    context = build_runtime_context()
+    registry = KeyHandlerRegistry()
+    viewer = context.viewer
+    data = context.data
 
-    frame_image_paths = get_frame_image_paths()
-
-    # [N, H, W, C] (RGB), val w.r.t. [0, 255]
-    images_rgb_nhwc_uint8 = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
-
-    # [N-1, H, W, 2] float
-    flow_nhw2_float32 = read_optical_flow_cache().numpy()
-    print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
-
-    # stroke prediction workflow
-    points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
-    generate_salient_images(points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
-    kd_tree_groups = BatchKDTree(points_all_candidates)
-    n_frame = images_rgb_nhwc_uint8.shape[0]
-    propagate_strokes_with_snapping_flow(flow_nhw2_float32,
-                                         images_rgb_nhwc_uint8,
-                                         kd_tree_groups,
-                                         n_frame,
-                                         strokes_test[flag_current_test_stroke])
-
-    images_rgb_nhwc_uint8_global = images_rgb_nhwc_uint8
-    flow_nhw2_float32_global = flow_nhw2_float32
-    kd_tree_groups_global = kd_tree_groups
-    strokes_test_global = strokes_test
-    n_frame_global = n_frame
-
-    def register_key_handler(key_char: str) -> Callable[[Callable[[], bool]], Callable[[], bool]]:
-        def decorator(func: Callable[[], bool]) -> Callable[[], bool]:
-            key_handlers[ord(key_char)] = func
-            return func
-        return decorator
-
-    key_handlers: Dict[int, Callable[[], bool]] = {}
-
-    @register_key_handler('a')
+    @registry.register('a')
     def handle_prev_frame() -> bool:
-        global flag_current_frame
-        if flag_current_frame > 0:
-            flag_current_frame -= 1
+        if viewer.current_frame > 0:
+            viewer.current_frame -= 1
         return False
 
-    @register_key_handler('d')
+    @registry.register('d')
     def handle_next_frame() -> bool:
-        global flag_current_frame
-        if flag_current_frame < n_frame_global - 1:
-            flag_current_frame += 1
+        if viewer.current_frame < data.images_rgb.shape[0] - 1:
+            viewer.current_frame += 1
         return False
 
-    @register_key_handler('z')
+    @registry.register('z')
     def toggle_origin_visibility() -> bool:
-        global is_visible_origin
-        is_visible_origin = not is_visible_origin
+        viewer.show_origin = not viewer.show_origin
         return False
 
-    @register_key_handler('x')
+    @registry.register('x')
     def toggle_flow_visibility() -> bool:
-        global is_visible_flow
-        is_visible_flow = not is_visible_flow
+        viewer.show_flow = not viewer.show_flow
         return False
 
-    @register_key_handler('c')
+    @registry.register('c')
     def toggle_snapping_visibility() -> bool:
-        global is_visible_snapping
-        is_visible_snapping = not is_visible_snapping
+        viewer.show_snapping = not viewer.show_snapping
         return False
 
-    @register_key_handler('v')
+    @registry.register('v')
     def toggle_fitted_visibility() -> bool:
-        global is_visible_fitted
-        is_visible_fitted = not is_visible_fitted
+        viewer.show_fitted = not viewer.show_fitted
         return False
 
     def create_switch_test_stroke_handler(index: int) -> Callable[[], bool]:
         def handler() -> bool:
-            global flag_current_test_stroke
-            if index >= len(strokes_test_global):
+            if index >= len(context.strokes_library):
                 return False
-            if index != flag_current_test_stroke:
-                flag_current_test_stroke = index
-                propagate_strokes_with_snapping_flow(
-                    flow_nhw2_float32_global,
-                    images_rgb_nhwc_uint8_global,
-                    kd_tree_groups_global,
-                    n_frame_global,
-                    strokes_test_global[flag_current_test_stroke]
-                )
+            if index != viewer.current_stroke_index:
+                viewer.current_stroke_index = index
+                propagate_current_stroke(context)
             return False
+
         return handler
 
     for idx, key_char in enumerate(('1', '2', '3')):
-        register_key_handler(key_char)(create_switch_test_stroke_handler(idx))
+        registry.register(key_char)(create_switch_test_stroke_handler(idx))
 
-    @register_key_handler('q')
+    @registry.register('q')
     def handle_quit() -> bool:
         return True
 
-    # use registered handlers to process key events
     while True:
-        # acquire input key
         key = cv2.waitKey(1) & 0xFF
-        handler = key_handlers.get(key)
-        if handler and handler():
+        if registry.dispatch(key):
             break
 
-        canvas = cv2.cvtColor(images_rgb_nhwc_uint8_global[flag_current_frame], cv2.COLOR_RGB2BGR)
-        draw_curves(canvas, strokes_test_global[flag_current_test_stroke])
+        canvas = cv2.cvtColor(context.data.images_rgb[viewer.current_frame], cv2.COLOR_RGB2BGR)
+        draw_curves(canvas, context)
 
-        cv2.imshow(target_name, canvas)
+        cv2.imshow(context.env.target_name, canvas)
 
 
 if __name__ == '__main__':
