@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from typing import List, Any
 
 import cv2
@@ -12,9 +12,23 @@ from utils.kd_tree import BatchKDTree
 from utils.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
-path_head = YamlUtil.read("config/test_video_init.yaml")['video']['url_head']
-target_name = path_head.split('/')[-1]
-stroke_save_folder_path = "stroke/" + target_name + "/"
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = BASE_DIR / "config"
+CACHE_DIR = BASE_DIR / "caches"
+STROKE_DIR = BASE_DIR / "stroke"
+DEBUG_DIR = BASE_DIR / "debug"
+
+_config_path = CONFIG_DIR / "test_video_init.yaml"
+path_head_raw = YamlUtil.read(str(_config_path))['video']['url_head']
+path_head = Path(path_head_raw)
+if not path_head.is_absolute():
+    path_head = (BASE_DIR / path_head).resolve()
+else:
+    path_head = path_head.resolve()
+
+target_name = path_head.name
+stroke_save_folder_path = STROKE_DIR / target_name
 
 print(f"tracing target: {target_name}")
 print(f"frame images folder: {path_head}")
@@ -22,20 +36,19 @@ print(f"frame images folder: {path_head}")
 
 def get_frame_image_paths():
     paths = sorted(
-        os.path.join(path_head, file_name)
-        for file_name in os.listdir(path_head)
-        if file_name.endswith((".jpg", ".png"))
+        path for path in path_head.iterdir()
+        if path.suffix.lower() in (".jpg", ".png")
     )
     return paths
 
 
 def read_strokes() -> List[np.ndarray]:
-    stroke_path_head = stroke_save_folder_path + "stroke_"
+    stroke_save_folder_path.mkdir(parents=True, exist_ok=True)
     out = []
     for i in range(1, 100):
-        path = stroke_path_head + f"{i:02d}" + ".npy"
-        if os.path.exists(path):
-            out.append(np.load(path).astype(np.float32))
+        path = stroke_save_folder_path / f"stroke_{i:02d}.npy"
+        if path.exists():
+            out.append(np.load(str(path)).astype(np.float32))
             print(f"Loaded stroke from:  {path}")
         else:
             # print(f"{path} does not exist")
@@ -43,51 +56,40 @@ def read_strokes() -> List[np.ndarray]:
     return out
 
 
-def read_images_batch(paths: List[str], flag: Any):
+def read_images_batch(paths: List[Path], flag: Any):
     out = []
     for i_path in tqdm(range(len(paths)), desc="Reading images:", unit=" image(s)"):
-        img = cv2.imread(paths[i_path], flag)
+        img = cv2.imread(str(paths[i_path]), flag)
         out.append(img)
     return np.stack(out)
 
 
 def read_optical_flow_cache() -> Tensor | None:
-    cache_path = "caches/" + target_name + ".pt"
-    if os.path.exists(cache_path):
-        return torch.load(cache_path)
+    cache_path = CACHE_DIR / f"{target_name}.pt"
+    if cache_path.exists():
+        return torch.load(str(cache_path))
     else:
-        ValueError("Optical flow cache file does not exist!")
-        return None
+        raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
 
 
 def generate_salient_images(points_all_candidates, height, width):
     for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
         canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
-
-        work_dir = "../debug/salient/" + target_name + "/"
-
-        if not os.path.exists(work_dir):
-            os.makedirs(work_dir)
-
-        file_path = work_dir + f"{i_img:03d}.jpg"
-
-        cv2.imwrite(file_path, canvas)
+        work_dir = DEBUG_DIR / "salient" / target_name
+        work_dir.mkdir(parents=True, exist_ok=True)
+        file_path = work_dir / f"{i_img:03d}.jpg"
+        cv2.imwrite(str(file_path), canvas)
 
 
 def generate_salient_stroke_images(points_stroke_candidates, height, width, i_frame):
     canvas = np.zeros((height, width), np.uint8)
     for i_group in range(len(points_stroke_candidates)):
         canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
-
-    work_dir = "debug/salient_stroke/" + target_name + "/"
-
-    if not os.path.exists(work_dir):
-        os.makedirs(work_dir)
-
-    file_path = work_dir + f"{i_frame:03d}.jpg"
-
-    cv2.imwrite(file_path, canvas)
+    work_dir = DEBUG_DIR / "salient_stroke" / target_name
+    work_dir.mkdir(parents=True, exist_ok=True)
+    file_path = work_dir / f"{i_frame:03d}.jpg"
+    cv2.imwrite(str(file_path), canvas)
 
 
 def generate_prediction_stroke_on_0(stroke_0: np.ndarray,
@@ -230,7 +232,7 @@ def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
 
 def main():
     global flag_current_frame, flag_current_test_stroke, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
-    EdgeSnappingConfig.load("config/snapping_init.yaml")
+    EdgeSnappingConfig.load(str(CONFIG_DIR / "snapping_init.yaml"))
     strokes_test = read_strokes()
 
     frame_image_paths = get_frame_image_paths()
