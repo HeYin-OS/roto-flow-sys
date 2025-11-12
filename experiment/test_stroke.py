@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Any
+from typing import Any, Callable, Dict, List
 
 import cv2
 import numpy as np
@@ -176,6 +176,13 @@ color_fitted = (50, 200, 50)  # Fresh Green
 
 thickness = 2
 
+# Global references for handlers
+images_rgb_nhwc_uint8_global: np.ndarray | None = None
+flow_nhw2_float32_global: np.ndarray | None = None
+kd_tree_groups_global: BatchKDTree | None = None
+strokes_test_global: List[np.ndarray] = []
+n_frame_global: int = 0
+
 
 def draw_curves(canvas: np.ndarray, stroke_origin: np.ndarray):
     global color_origin, color_flow, color_snapping, color_fitted
@@ -231,7 +238,17 @@ def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
 
 
 def main():
-    global flag_current_frame, flag_current_test_stroke, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
+    global images_rgb_nhwc_uint8_global
+    global flow_nhw2_float32_global
+    global kd_tree_groups_global
+    global strokes_test_global
+    global n_frame_global
+    global flag_current_frame
+    global flag_current_test_stroke
+    global is_visible_origin
+    global is_visible_flow
+    global is_visible_snapping
+    global is_visible_fitted
     EdgeSnappingConfig.load(str(CONFIG_DIR / "snapping_init.yaml"))
     strokes_test = read_strokes()
 
@@ -255,41 +272,92 @@ def main():
                                          n_frame,
                                          strokes_test[flag_current_test_stroke])
 
-    # use A D to switch frames
-    # z x c d to switch stroke visibility
-    # 1 2 3 to switch tested stroke index
+    images_rgb_nhwc_uint8_global = images_rgb_nhwc_uint8
+    flow_nhw2_float32_global = flow_nhw2_float32
+    kd_tree_groups_global = kd_tree_groups
+    strokes_test_global = strokes_test
+    n_frame_global = n_frame
+
+    def register_key_handler(key_char: str) -> Callable[[Callable[[], bool]], Callable[[], bool]]:
+        def decorator(func: Callable[[], bool]) -> Callable[[], bool]:
+            key_handlers[ord(key_char)] = func
+            return func
+        return decorator
+
+    key_handlers: Dict[int, Callable[[], bool]] = {}
+
+    @register_key_handler('a')
+    def handle_prev_frame() -> bool:
+        global flag_current_frame
+        if flag_current_frame > 0:
+            flag_current_frame -= 1
+        return False
+
+    @register_key_handler('d')
+    def handle_next_frame() -> bool:
+        global flag_current_frame
+        if flag_current_frame < n_frame_global - 1:
+            flag_current_frame += 1
+        return False
+
+    @register_key_handler('z')
+    def toggle_origin_visibility() -> bool:
+        global is_visible_origin
+        is_visible_origin = not is_visible_origin
+        return False
+
+    @register_key_handler('x')
+    def toggle_flow_visibility() -> bool:
+        global is_visible_flow
+        is_visible_flow = not is_visible_flow
+        return False
+
+    @register_key_handler('c')
+    def toggle_snapping_visibility() -> bool:
+        global is_visible_snapping
+        is_visible_snapping = not is_visible_snapping
+        return False
+
+    @register_key_handler('v')
+    def toggle_fitted_visibility() -> bool:
+        global is_visible_fitted
+        is_visible_fitted = not is_visible_fitted
+        return False
+
+    def create_switch_test_stroke_handler(index: int) -> Callable[[], bool]:
+        def handler() -> bool:
+            global flag_current_test_stroke
+            if index >= len(strokes_test_global):
+                return False
+            if index != flag_current_test_stroke:
+                flag_current_test_stroke = index
+                propagate_strokes_with_snapping_flow(
+                    flow_nhw2_float32_global,
+                    images_rgb_nhwc_uint8_global,
+                    kd_tree_groups_global,
+                    n_frame_global,
+                    strokes_test_global[flag_current_test_stroke]
+                )
+            return False
+        return handler
+
+    for idx, key_char in enumerate(('1', '2', '3')):
+        register_key_handler(key_char)(create_switch_test_stroke_handler(idx))
+
+    @register_key_handler('q')
+    def handle_quit() -> bool:
+        return True
+
+    # use registered handlers to process key events
     while True:
         # acquire input key
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('a'):
-            if flag_current_frame > 0:
-                flag_current_frame = flag_current_frame - 1
-        elif key == ord('d'):
-            if flag_current_frame < n_frame - 1:
-                flag_current_frame = flag_current_frame + 1
-        elif key == ord('z'):
-            is_visible_origin = not is_visible_origin
-        elif key == ord('x'):
-            is_visible_flow = not is_visible_flow
-        elif key == ord('c'):
-            is_visible_snapping = not is_visible_snapping
-        elif key == ord('v'):
-            is_visible_fitted = not is_visible_fitted
-        elif key == ord('1') or key == ord('2') or key == ord('3'):
-            i_test = key - ord('1')
-            if i_test != flag_current_test_stroke:
-                flag_current_test_stroke = i_test
-                propagate_strokes_with_snapping_flow(flow_nhw2_float32,
-                                                     images_rgb_nhwc_uint8,
-                                                     kd_tree_groups,
-                                                     n_frame,
-                                                     strokes_test[flag_current_test_stroke])
-
-        elif key == ord('q'):
+        handler = key_handlers.get(key)
+        if handler and handler():
             break
 
-        canvas = cv2.cvtColor(images_rgb_nhwc_uint8[flag_current_frame], cv2.COLOR_RGB2BGR)
-        draw_curves(canvas, strokes_test[flag_current_test_stroke])
+        canvas = cv2.cvtColor(images_rgb_nhwc_uint8_global[flag_current_frame], cv2.COLOR_RGB2BGR)
+        draw_curves(canvas, strokes_test_global[flag_current_test_stroke])
 
         cv2.imshow(target_name, canvas)
 
