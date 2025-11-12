@@ -12,9 +12,9 @@ from utils.kd_tree import BatchKDTree
 from utils.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
-path_head = "." + YamlUtil.read("../config/test_video_init.yaml")['video']['url_head']
+path_head = YamlUtil.read("config/test_video_init.yaml")['video']['url_head']
 target_name = path_head.split('/')[-1]
-stroke_save_folder_path = "../stroke/" + target_name + "/"
+stroke_save_folder_path = "stroke/" + target_name + "/"
 
 print(f"tracing target: {target_name}")
 print(f"frame images folder: {path_head}")
@@ -52,7 +52,7 @@ def read_images_batch(paths: List[str], flag: Any):
 
 
 def read_optical_flow_cache() -> Tensor | None:
-    cache_path = "../caches/" + target_name + ".pt"
+    cache_path = "caches/" + target_name + ".pt"
     if os.path.exists(cache_path):
         return torch.load(cache_path)
     else:
@@ -63,7 +63,7 @@ def read_optical_flow_cache() -> Tensor | None:
 def generate_salient_images(points_all_candidates, height, width):
     for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
-        canvas[points_all_candidates[i_img][:, 1], points_all_candidates[i_img][:, 0]] = 255
+        canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
 
         work_dir = "../debug/salient/" + target_name + "/"
 
@@ -80,7 +80,7 @@ def generate_salient_stroke_images(points_stroke_candidates, height, width, i_fr
     for i_group in range(len(points_stroke_candidates)):
         canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
 
-    work_dir = "../debug/salient_stroke/" + target_name + "/"
+    work_dir = "debug/salient_stroke/" + target_name + "/"
 
     if not os.path.exists(work_dir):
         os.makedirs(work_dir)
@@ -230,7 +230,7 @@ def propagate_strokes_with_snapping_flow(flow_nhw2_float32: np.ndarray,
 
 def main():
     global flag_current_frame, flag_current_test_stroke, is_visible_origin, is_visible_flow, is_visible_snapping, is_visible_fitted
-    EdgeSnappingConfig.load("../config/snapping_init.yaml")
+    EdgeSnappingConfig.load("config/snapping_init.yaml")
     strokes_test = read_strokes()
 
     frame_image_paths = get_frame_image_paths()
@@ -244,6 +244,7 @@ def main():
 
     # stroke prediction workflow
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
+    generate_salient_images(points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
     kd_tree_groups = BatchKDTree(points_all_candidates)
     n_frame = images_rgb_nhwc_uint8.shape[0]
     propagate_strokes_with_snapping_flow(flow_nhw2_float32,
@@ -275,7 +276,7 @@ def main():
         elif key == ord('1') or key == ord('2') or key == ord('3'):
             i_test = key - ord('1')
             if i_test != flag_current_test_stroke:
-                flag_current_test_stroke = i_tested
+                flag_current_test_stroke = i_test
                 propagate_strokes_with_snapping_flow(flow_nhw2_float32,
                                                      images_rgb_nhwc_uint8,
                                                      kd_tree_groups,

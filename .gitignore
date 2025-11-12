@@ -3,3 +3,5 @@
 /dinov3/
 /test/
 /.idea/
+/.vscode/
+__pycache__/
