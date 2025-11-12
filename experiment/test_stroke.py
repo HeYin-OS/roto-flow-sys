@@ -21,6 +21,8 @@ THICKNESS = 2
 
 @dataclass(frozen=True)
 class ProjectPaths:
+    """Absolute paths derived from the project root, shared across the module."""
+
     base: Path
     config: Path
     cache: Path
@@ -30,29 +32,41 @@ class ProjectPaths:
 
 @dataclass(frozen=True)
 class StrokeEnvironment:
+    """Static environment information loaded from configuration files."""
+
     paths: ProjectPaths
     frame_dir: Path
     target_name: str
 
     @property
     def stroke_dir(self) -> Path:
+        """Directory used to cache stroke *.npy files for the current target."""
+
         return self.paths.stroke / self.target_name
 
     @property
     def cache_file(self) -> Path:
+        """Path to the optical-flow cache tensor for the current target."""
+
         return self.paths.cache / f"{self.target_name}.pt"
 
     @property
     def salient_dir(self) -> Path:
+        """Directory used to dump candidate salient points for debugging."""
+
         return self.paths.debug / "salient" / self.target_name
 
     @property
     def salient_stroke_dir(self) -> Path:
+        """Directory used to dump salient stroke groups for debugging."""
+
         return self.paths.debug / "salient_stroke" / self.target_name
 
 
 @dataclass
 class ViewerState:
+    """Mutable UI state controlled by keyboard shortcuts."""
+
     current_frame: int = 0
     current_stroke_index: int = 0
     show_origin: bool = True
@@ -63,11 +77,15 @@ class ViewerState:
 
 @dataclass
 class StrokeBuffers:
+    """Frame-aligned buffers containing different stroke propagation results."""
+
     flow: List[np.ndarray | None] = field(default_factory=list)
     snapping: List[np.ndarray | None] = field(default_factory=list)
     fitted: List[np.ndarray | None] = field(default_factory=list)
 
     def reset(self, n_frame: int) -> None:
+        """Pre-allocate buffers with None placeholders for `n_frame` frames."""
+
         self.flow = [None] * n_frame
         self.snapping = [None] * n_frame
         self.fitted = [None] * n_frame
@@ -75,6 +93,8 @@ class StrokeBuffers:
 
 @dataclass
 class StrokeData:
+    """In-memory data required to propagate strokes over all frames."""
+
     images_rgb: np.ndarray
     flow_nhw2: np.ndarray
     kd_tree: BatchKDTree
@@ -82,6 +102,8 @@ class StrokeData:
 
 @dataclass
 class RuntimeContext:
+    """Aggregated structure bundling environment, data, buffers, and state."""
+
     env: StrokeEnvironment
     data: StrokeData
     strokes_library: List[np.ndarray]
@@ -90,10 +112,14 @@ class RuntimeContext:
 
 
 class KeyHandlerRegistry:
+    """Simple registry used to map a keyboard key to its handler callback."""
+
     def __init__(self) -> None:
         self._handlers: Dict[int, Callable[[], bool]] = {}
 
     def register(self, key_char: str) -> Callable[[Callable[[], bool]], Callable[[], bool]]:
+        """Decorator that associates a handler with a single-character key."""
+
         def decorator(func: Callable[[], bool]) -> Callable[[], bool]:
             self._handlers[ord(key_char)] = func
             return func
@@ -101,11 +127,15 @@ class KeyHandlerRegistry:
         return decorator
 
     def dispatch(self, key_code: int) -> bool:
+        """Execute the handler corresponding to `key_code`, if any."""
+
         handler = self._handlers.get(key_code)
         return handler() if handler else False
 
 
 def build_project_paths() -> ProjectPaths:
+    """Construct an immutable `ProjectPaths` instance anchored at repo root."""
+
     base = Path(__file__).resolve().parent.parent
     return ProjectPaths(
         base=base,
@@ -117,6 +147,8 @@ def build_project_paths() -> ProjectPaths:
 
 
 def load_environment() -> StrokeEnvironment:
+    """Load configuration metadata and resolve frame directory for the target."""
+
     paths = build_project_paths()
     config_path = paths.config / "test_video_init.yaml"
     config_data = YamlUtil.read(str(config_path))
@@ -130,6 +162,8 @@ def load_environment() -> StrokeEnvironment:
 
 
 def get_frame_image_paths(env: StrokeEnvironment) -> List[Path]:
+    """List and sort available frame paths for the current target."""
+
     return sorted(
         path for path in env.frame_dir.iterdir()
         if path.suffix.lower() in (".jpg", ".png")
@@ -137,6 +171,8 @@ def get_frame_image_paths(env: StrokeEnvironment) -> List[Path]:
 
 
 def read_strokes(env: StrokeEnvironment) -> List[np.ndarray]:
+    """Load cached stroke numpy arrays, if present, in ascending order."""
+
     env.stroke_dir.mkdir(parents=True, exist_ok=True)
     strokes: List[np.ndarray] = []
     for i in range(1, 100):
@@ -149,6 +185,8 @@ def read_strokes(env: StrokeEnvironment) -> List[np.ndarray]:
 
 
 def read_images_batch(paths: List[Path], flag: Any) -> np.ndarray:
+    """Read `paths` sequentially into a stacked numpy array."""
+
     out = []
     for i_path in tqdm(range(len(paths)), desc="Reading images:", unit=" image(s)"):
         img = cv2.imread(str(paths[i_path]), flag)
@@ -157,13 +195,17 @@ def read_images_batch(paths: List[Path], flag: Any) -> np.ndarray:
 
 
 def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
+    """Load the precomputed optical-flow tensor for the configured target."""
+
     cache_path = env.cache_file
     if cache_path.exists():
         return torch.load(str(cache_path))
     raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
 
 
-def generate_salient_images(env: StrokeEnvironment, points_all_candidates, height: int, width: int) -> None:
+def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[np.ndarray], height: int, width: int) -> None:
+    """Dump salient edge candidate maps for debugging or offline inspection."""
+
     for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
         canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
@@ -173,7 +215,9 @@ def generate_salient_images(env: StrokeEnvironment, points_all_candidates, heigh
         cv2.imwrite(str(file_path), canvas)
 
 
-def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates, height: int, width: int, i_frame: int) -> None:
+def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates: List[np.ndarray], height: int, width: int, i_frame: int) -> None:
+    """Dump stroke-wise salient candidates for a particular frame."""
+
     canvas = np.zeros((height, width), np.uint8)
     for i_group in range(len(points_stroke_candidates)):
         canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
@@ -189,6 +233,8 @@ def rgb_to_bgr(color: tuple) -> tuple:
 
 
 def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, stroke_0: np.ndarray) -> None:
+    """Snap the reference stroke onto frame-0 edges prior to propagation."""
+
     points_stroke_candidate = data.kd_tree.query_batch(
         0,
         stroke_0,
@@ -203,6 +249,8 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
 
 
 def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeData) -> None:
+    """Iteratively propagate strokes across frames using flow & snapping."""
+
     for i in tqdm(range(data.images_rgb.shape[0] - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch"):
         i_frame = i + 1
 
@@ -247,6 +295,8 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
 
 
 def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffers, stroke_initial: np.ndarray) -> None:
+    """Full propagation pipeline for a single initial stroke polyline."""
+
     n_frame = data.images_rgb.shape[0]
     buffers.reset(n_frame)
     buffers.flow[0] = None
@@ -257,6 +307,8 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
 
 
 def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
+    """Render all requested stroke overlays onto `canvas`."""
+
     state = context.viewer
     buffers = context.buffers
 
@@ -279,11 +331,15 @@ def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
 
 
 def propagate_current_stroke(context: RuntimeContext) -> None:
+    """Re-run propagation for the stroke chosen by the viewer."""
+
     stroke = context.strokes_library[context.viewer.current_stroke_index]
     propagate_strokes_with_snapping_flow(context.data, context.buffers, stroke)
 
 
 def build_runtime_context() -> RuntimeContext:
+    """Collect all runtime dependencies and execute initial propagation."""
+
     env = load_environment()
     print(f"tracing target: {env.target_name}")
     print(f"frame images folder: {env.frame_dir}")
@@ -330,6 +386,8 @@ def build_runtime_context() -> RuntimeContext:
 
 
 def main():
+    """Entry point used when launching the module as a script."""
+
     context = build_runtime_context()
     registry = KeyHandlerRegistry()
     viewer = context.viewer
@@ -386,6 +444,7 @@ def main():
         return True
 
     while True:
+        # Poll for keyboard events via OpenCV and dispatch to registered handlers.
         key = cv2.waitKey(1) & 0xFF
         if registry.dispatch(key):
             break
