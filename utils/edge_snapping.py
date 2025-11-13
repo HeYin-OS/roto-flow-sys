@@ -1,49 +1,20 @@
-import os
 from typing import List, Any
 import cv2
 import numba
 
 import numpy as np
 import torch
-from PIL import Image
-from PySide6.QtCore import QPoint, Q_ARG, Q_RETURN_ARG
-from cv2 import pointPolygonTest
-from functorch.dim import pointwise
-from numpy import ndarray
-from sympy.integrals.intpoly import point_sort
 from torch import Tensor
 from tqdm import tqdm
 
 from utils.yaml_reader import YamlUtil
-
-
-def getDpi(imgUrl):
-    img = Image.open(imgUrl)
-    dpi = img.info.get('dpi', (96, 96))
-    return dpi
-
-
-def mm_to_pixels(mm, imgUrl):
-    inches = mm / 25.4
-    dpi = getDpi(imgUrl)
-    pixel_length = dpi[0] * inches
-    return pixel_length
-
-
-def create_gaussian_kernel(size, sigma, direction):
-    kernel = cv2.getGaussianKernel(size, sigma, cv2.CV_32F)
-    if direction == 0:
-        return kernel
-    elif direction == 1:
-        return kernel.T
-    return None
-
-
-def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
-    kernel1 = create_gaussian_kernel(size, sigma_c, direction)
-    kernel2 = create_gaussian_kernel(size, sigma_s, direction)
-    dog_kernel = kernel1 - rho * kernel2
-    return dog_kernel
+from utils.edge_snapping_utils import (
+    create_gaussian_kernel,
+    create_fdog_kernel,
+    rgb_np_to_gray_tensor,
+    pack_jagged_list_to_array,
+    slice_candidate_group_by_index,
+)
 
 
 def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
@@ -341,51 +312,6 @@ def compute_weights(H: int, W: int,
     return weights
 
 
-def slice_candidate_group_by_index(candidates_flatten_xy: np.ndarray, flatten_index_ptr: np.ndarray, i: int) \
-        -> tuple[np.ndarray, np.ndarray]:
-    Ui = slice(flatten_index_ptr[i], flatten_index_ptr[i + 1])
-    Uj = slice(flatten_index_ptr[i + 1], flatten_index_ptr[i + 2])
-    Qi_xy = candidates_flatten_xy[Ui]
-    Qj_xy = candidates_flatten_xy[Uj]
-    return Qi_xy, Qj_xy
-
-
-def rgb_np_to_gray_tensor(device, image_rgb_hwc: np.ndarray) -> Tensor:
-    image_gray_hw = cv2.cvtColor(image_rgb_hwc.astype(np.float32), cv2.COLOR_RGB2GRAY) / 255.0
-    image_tensor_gray_gpu = (
-        torch.from_numpy(image_gray_hw)
-        .unsqueeze(0).unsqueeze(0)
-        .to(device, non_blocking=True)
-        .contiguous()
-    )  # shape: [1, 1, H, W]
-    return image_tensor_gray_gpu
-
-
-# make jagged array to a integrated long array with index range pointer page
-def pack_jagged_list_to_array(points_stroke_candidate: List[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    # total number of stroke points
-    n_stroke_points = len(points_stroke_candidate)
-
-    # index range pointer, index_ptr[i] means the start idx such that index_ptr[i+1] - index_ptr[i] means total number of current index
-    index_ptr = np.zeros(n_stroke_points + 1, dtype=np.int32)
-    for i in range(n_stroke_points):
-        index_ptr[i + 1] = index_ptr[i] + (0 if points_stroke_candidate[i] is None else len(points_stroke_candidate[i]))
-    n_total_candidates = index_ptr[-1]
-
-    # flatten candidate points array
-    points_flatten = np.empty((n_total_candidates, 2), dtype=np.float32)
-    i_current = 0
-    for i in range(n_stroke_points):
-        points = points_stroke_candidate[i]
-        if points is None or len(points) == 0:
-            continue
-        # make sure it is in float format
-        points_float = points.astype(np.float32)
-        # build flatten array
-        points_flatten[i_current: i_current + len(points), :] = points_float[:, :]
-        i_current += len(points)
-
-    return points_flatten, index_ptr
 
 
 def compute_affine_theta_vectorized(Q_i: np.ndarray,

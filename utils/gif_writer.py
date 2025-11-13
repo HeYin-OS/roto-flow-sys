@@ -83,3 +83,63 @@ def save_gif_from_bgr_frames(
         optimize=optimize,
         disposal=disposal,
     )
+
+
+def save_fixed_length_gif_from_bgr(
+        frames_bgr: Union[Sequence[np.ndarray], np.ndarray],
+        out_path: str,
+        fps: float = 10.0,
+        loop: int = 0,
+        optimize: bool = True,
+        dither: int = Image.FLOYDSTEINBERG,
+        palette: Optional[str] = "mediancut",
+        disposal: int = 2,
+        target_frames: int = 28,
+) -> None:
+    """
+    将 NHWC-uint8-BGR 的图像序列重采样为固定帧数（默认 28 帧），并编码为 GIF。
+
+    参数:
+        frames_bgr:   形状为 (T,H,W,3) 的 ndarray 或帧序列，每帧 uint8、BGR 通道。
+        out_path:     输出 GIF 路径（.gif）。
+        fps:          GIF 目标帧率。
+        loop:         循环次数；0 表示无限循环。
+        optimize:     Pillow 的优化开关。
+        dither:       量化抖动方式。
+        palette:      调色板算法，None 表示留给 Pillow 自动量化。
+        disposal:     帧处置方式。
+        target_frames: 目标帧数，默认 28。
+    """
+    if target_frames <= 0:
+        raise ValueError("target_frames 必须为正整数。")
+
+    if isinstance(frames_bgr, np.ndarray):
+        if frames_bgr.ndim != 4 or frames_bgr.shape[-1] != 3:
+            raise ValueError("frames_bgr 应为形状 (T,H,W,3) 的NHWC数组")
+        frames_list = [frames_bgr[i] for i in range(frames_bgr.shape[0])]
+    else:
+        frames_list = list(frames_bgr)
+
+    if len(frames_list) == 0:
+        raise ValueError("没有可用的帧。")
+
+    # --- 调整帧数到目标值 ---
+    n_frames = len(frames_list)
+    if n_frames > target_frames:
+        indices = np.linspace(0, n_frames - 1, target_frames, dtype=int)
+        frames_list = [frames_list[i] for i in indices]
+    elif n_frames < target_frames:
+        pad_frame = frames_list[-1]
+        frames_list.extend([pad_frame.copy() for _ in range(target_frames - n_frames)])
+
+    # --- 调用基础保存函数 ---
+    save_gif_from_bgr_frames(
+        frames_list,
+        out_path=out_path,
+        fps=fps,
+        loop=loop,
+        optimize=optimize,
+        dither=dither,
+        palette=palette,
+        disposal=disposal,
+    )
