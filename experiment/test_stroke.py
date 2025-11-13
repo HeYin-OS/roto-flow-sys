@@ -11,6 +11,7 @@ from tqdm import tqdm
 from utils.edge_snapping import compute_all_candidates, EdgeSnappingConfig, local_snapping
 from utils.kd_tree import BatchKDTree
 from utils.yaml_reader import YamlUtil
+from utils.gif_writer import save_fixed_length_gif_from_bgr
 
 COLOR_ORIGIN = (255, 255, 0)  # Vivid Orange
 COLOR_FLOW = (200, 130, 255)  # Soft Lavender
@@ -335,6 +336,50 @@ def propagate_current_stroke(context: RuntimeContext) -> None:
 
     stroke = context.strokes_library[context.viewer.current_stroke_index]
     propagate_strokes_with_snapping_flow(context.data, context.buffers, stroke)
+    export_stroke_gifs(context)
+
+
+def export_stroke_gifs(context: RuntimeContext) -> None:
+    """Export stroke propagation results to GIFs grouped by stroke categories."""
+
+    env = context.env
+    data = context.data
+    buffers = context.buffers
+    n_frame = data.images_rgb.shape[0]
+    target_dir = env.paths.debug / "results" / env.target_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stroke_categories = (
+        ("flow", buffers.flow, COLOR_FLOW),
+        ("snapping", buffers.snapping, COLOR_SNAPPING),
+        ("fitted", buffers.fitted, COLOR_FITTED),
+    )
+
+    for name, strokes, color_rgb in stroke_categories:
+        frames_bgr: List[np.ndarray] = []
+
+        for idx in tqdm(range(n_frame), desc=f"Building {name} GIF", unit=" frame(s)"):
+            background = cv2.cvtColor(data.images_rgb[idx], cv2.COLOR_RGB2BGR)
+            stroke_data = strokes[idx]
+            if stroke_data is not None:
+                cv2.polylines(
+                    background,
+                    [stroke_data.astype(np.int32)],
+                    False,
+                    rgb_to_bgr(color_rgb),
+                    THICKNESS,
+                    lineType=cv2.LINE_AA,
+                )
+            frames_bgr.append(background)
+
+        out_path = target_dir / f"{name}.gif"
+        save_fixed_length_gif_from_bgr(
+            frames_bgr,
+            out_path=str(out_path),
+            fps=12.0,
+            loop=0,
+            optimize=True,
+        )
 
 
 def build_runtime_context() -> RuntimeContext:
