@@ -350,9 +350,9 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
 
     stroke_categories = (
+        ("fitted", buffers.fitted, COLOR_FITTED),
         ("flow", buffers.flow, COLOR_FLOW),
         ("snapping", buffers.snapping, COLOR_SNAPPING),
-        ("fitted", buffers.fitted, COLOR_FITTED),
     )
 
     for name, strokes, color_rgb in stroke_categories:
@@ -373,12 +373,16 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
             frames_bgr.append(background)
 
         out_path = target_dir / f"{name}.gif"
+        reference_curve = None
+        if name == "fitted" and strokes[0] is not None:
+            reference_curve = strokes[0]
         save_fixed_length_gif_from_bgr(
             frames_bgr,
             out_path=str(out_path),
             fps=12.0,
             loop=0,
             optimize=True,
+            reference_curve=reference_curve,
         )
 
 

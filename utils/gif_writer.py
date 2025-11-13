@@ -1,7 +1,55 @@
-from typing import Iterable, Sequence, Union, Optional
+from typing import Iterable, Sequence, Union, Optional, Tuple
 import numpy as np
 from PIL import Image
 import warnings
+
+
+_GLOBAL_CROP_SLICE: Optional[Tuple[int, int, int, int]] = None  # (y0, y1, x0, x1)
+
+
+def _compute_crop_slice(
+        frame_shape: Tuple[int, int, int],
+        anchor_xy: Optional[Tuple[float, float]],
+        crop_size: Tuple[int, int],
+) -> Tuple[int, int, int, int]:
+    """
+    根据锚点位置计算裁剪窗口，并确保处于图像范围内。
+
+    参数:
+        frame_shape: 原始帧的形状 (H, W, C)。
+        anchor_xy:   锚点坐标 (x, y)，若为 None 则使用图像中心。
+        crop_size:   (height, width) 元组。
+
+    返回:
+        (y0, y1, x0, x1) 的裁剪窗口坐标。
+    """
+    height, width = frame_shape[0], frame_shape[1]
+    crop_h, crop_w = crop_size
+
+    crop_h = min(crop_h, height)
+    crop_w = min(crop_w, width)
+
+    cx, cy = (width // 2, height // 2)
+    if anchor_xy is not None:
+        cx = int(round(anchor_xy[0]))
+        cy = int(round(anchor_xy[1]))
+
+    half_w = crop_w // 2
+    half_h = crop_h // 2
+
+    x0 = max(0, cx - half_w)
+    y0 = max(0, cy - half_h)
+    x1 = x0 + crop_w
+    y1 = y0 + crop_h
+
+    if x1 > width:
+        x1 = width
+        x0 = x1 - crop_w
+    if y1 > height:
+        y1 = height
+        y0 = y1 - crop_h
+
+    return y0, y1, x0, x1
 
 
 def save_gif_from_bgr_frames(
@@ -95,6 +143,8 @@ def save_fixed_length_gif_from_bgr(
         palette: Optional[str] = "mediancut",
         disposal: int = 2,
         target_frames: int = 28,
+        reference_curve: Optional[np.ndarray] = None,
+        crop_size: Tuple[int, int] = (600, 800),
 ) -> None:
     """
     将 NHWC-uint8-BGR 的图像序列重采样为固定帧数（默认 28 帧），并编码为 GIF。
@@ -109,6 +159,8 @@ def save_fixed_length_gif_from_bgr(
         palette:      调色板算法，None 表示留给 Pillow 自动量化。
         disposal:     帧处置方式。
         target_frames: 目标帧数，默认 28。
+        reference_curve: 用于确定裁剪中心的折线点集（通常为 fitted 的第一个曲线）。
+        crop_size:    裁剪区域尺寸 (height, width)，默认 600x800。
     """
     if target_frames <= 0:
         raise ValueError("target_frames 必须为正整数。")
@@ -131,6 +183,18 @@ def save_fixed_length_gif_from_bgr(
     elif n_frames < target_frames:
         pad_frame = frames_list[-1]
         frames_list.extend([pad_frame.copy() for _ in range(target_frames - n_frames)])
+
+    # --- 裁剪区域 ---
+    global _GLOBAL_CROP_SLICE
+    if _GLOBAL_CROP_SLICE is None:
+        anchor_xy = None
+        if reference_curve is not None and len(reference_curve) > 0:
+            anchor_xy = (float(reference_curve[0][0]), float(reference_curve[0][1]))
+        _GLOBAL_CROP_SLICE = _compute_crop_slice(frames_list[0].shape, anchor_xy, crop_size)
+
+    if _GLOBAL_CROP_SLICE is not None:
+        y0, y1, x0, x1 = _GLOBAL_CROP_SLICE
+        frames_list = [frame[y0:y1, x0:x1] for frame in frames_list]
 
     # --- 调用基础保存函数 ---
     save_gif_from_bgr_frames(
