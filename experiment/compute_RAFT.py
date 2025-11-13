@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from typing import List
 
 import cv2
@@ -12,26 +12,41 @@ from torchvision.utils import flow_to_image
 from utils.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
-path_head = "." + YamlUtil.read("../config/test_video_init.yaml")['video']['url_head']
-target_name = path_head.split('/')[-1]
-stroke_save_folder_path = "../stroke/" + target_name + "/"
 
-print(f"frame images folder: {path_head}")
+def build_project_paths() -> tuple[Path, Path, Path, Path, Path]:
+    """按照 test_stroke.py 的逻辑解析项目路径。"""
+
+    base = Path(__file__).resolve().parent.parent
+    config_dir = base / "config"
+    cache_dir = base / "caches"
+    frame_dir_raw = YamlUtil.read(str(config_dir / "test_video_init.yaml"))['video']['url_head']
+
+    frame_dir = (base / frame_dir_raw).resolve() if not Path(frame_dir_raw).is_absolute() else Path(frame_dir_raw).resolve()
+    debug_dir = base / "debug"
+    stroke_dir = base / "stroke"
+
+    return base, config_dir, cache_dir, frame_dir, debug_dir, stroke_dir
 
 
-def get_frame_image_paths():
-    out = sorted(
-        os.path.join(path_head, file_name)
-        for file_name in os.listdir(path_head)
-        if file_name.endswith((".jpg", ".png"))
+BASE_DIR, CONFIG_DIR, CACHE_DIR, FRAME_DIR, DEBUG_DIR, STROKE_DIR = build_project_paths()
+TARGET_NAME = FRAME_DIR.name
+
+print(f"frame images folder: {FRAME_DIR}")
+
+
+def get_frame_image_paths() -> List[Path]:
+    """获取当前目标的帧图像路径列表。"""
+    return sorted(
+        path for path in FRAME_DIR.iterdir()
+        if path.suffix.lower() in (".jpg", ".png")
     )
-    return out
 
 
-def read_image_for_RAFT(paths: List[str]):
+def read_image_for_RAFT(paths: List[Path]) -> np.ndarray:
+    """读取并归一化用于 RAFT 的图像序列。"""
     out = []
     for path in paths:
-        img = cv2.imread(path)
+        img = cv2.imread(str(path))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         out.append(np.transpose(img, (2, 0, 1)))
@@ -43,11 +58,11 @@ def read_image_for_RAFT(paths: List[str]):
 
 def compute_optical_flow_vector_fields(images_np: np.ndarray):
     # if it has cache, load the cache
-    cache_path = "../caches/" + target_name + ".pt"
+    cache_path = CACHE_DIR / f"{TARGET_NAME}.pt"
 
-    if os.path.exists(cache_path):
+    if cache_path.exists():
         print(f"Already exists at: {cache_path}")
-        return torch.load(cache_path)
+        return torch.load(str(cache_path))
 
     # compute the vector fields
     images_tensor = torch.from_numpy(images_np)
@@ -65,7 +80,8 @@ def compute_optical_flow_vector_fields(images_np: np.ndarray):
 
     results = torch.stack(flow_list, dim=0)
 
-    torch.save(results, cache_path)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(results, str(cache_path))
 
     print(f"Saved results: {cache_path}")
 
@@ -76,13 +92,12 @@ def write_rgb_flow_images(flow: Tensor):
     flow_imgs = flow_to_image(flow.permute(0, 3, 1, 2))
     flow_imgs_np = flow_imgs.permute(0, 2, 3, 1).cpu().numpy()
 
-    work_dir = "../debug/flow/" + target_name + "/"
-
-    os.makedirs(work_dir)
+    work_dir = DEBUG_DIR / "flow" / TARGET_NAME
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     for i in tqdm(range(flow_imgs_np.shape[0]), desc="Writing RGB flow images:", unit="image"):
-        path = work_dir + f"frame_{i:2d}_to_{i + 1:2d}.jpg"
-        cv2.imwrite(path, flow_imgs_np[i])
+        path = work_dir / f"frame_{i:02d}_to_{i + 1:02d}.jpg"
+        cv2.imwrite(str(path), flow_imgs_np[i])
 
 
 if __name__ == "__main__":

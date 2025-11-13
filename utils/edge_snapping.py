@@ -110,6 +110,14 @@ class EdgeSnappingConfig:
 def local_snapping(stroke: np.ndarray,
                    image_rgb_hwc: np.ndarray,
                    points_stroke_candidate: List[np.ndarray]):
+    """
+    局部优化步骤：将用户笔画吸附到图像边缘特征上。
+    
+    实现论文 Section 3.1 的算法：
+    1. 构建链状图 G = (V, E)，其中 V = U_0^N Q_i（Q_0 为虚拟起始点，通过将第一组能量设为0实现）
+    2. 对每条边 e = (q_{i,k}, q_{i+1,k'}) 计算权重 w_e（Equation 3）
+    3. 使用动态规划找最短路径（对应论文中的 s'_1）
+    """
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
 
@@ -134,7 +142,8 @@ def local_snapping(stroke: np.ndarray,
     energy = np.full(n_candidate_points, np.inf, dtype=np.float32)
     prev = np.full(n_candidate_points, -1, dtype=np.int32)
 
-    # accumulated energy for first candidate group is zero
+    # 虚拟起始点 Q_0 的处理：将第一组候选点的能量设为0（等价于添加虚拟起始点）
+    # 论文中 V = U_0^N Q_i，其中 Q_0 = {q_{0,0}} 是虚拟点
     energy[flatten_index_ptr[0]: flatten_index_ptr[1]] = 0.0
 
     for i_group in range(stroke_len - 1):
@@ -168,7 +177,7 @@ def local_snapping(stroke: np.ndarray,
 def candidate_point_sets_defense(points_candidate: list[np.ndarray], stroke: np.ndarray) -> list[np.ndarray]:
     fixed_candidates = []
     for t, cand in enumerate(points_candidate):
-        if cand is None:
+        if cand is None or (isinstance(cand, np.ndarray) and cand.size == 0):
             p = stroke[t].astype(np.float32)
             fixed_candidates.append(np.array([[p[0], p[1]]], dtype=np.float32))
         else:
@@ -247,6 +256,18 @@ def compute_weights(H: int, W: int,
                     Q_i: np.ndarray, Q_j: np.ndarray,
                     image_gray_chw: Tensor,
                     device):
+    """
+    计算边权重 w_e（论文 Equation 3）。
+    
+    对于每条边 e = (q_{i,k}, q_{i+1,k'})：
+    - 计算中点 m = (q_{i,k} + q_{i+1,k'}) / 2
+    - 计算方向 v = normalize(q_{i+1,k'} - q_{i,k})
+    - 计算垂直方向 u = rotate_90(v)
+    - 应用 FDoG 滤波器 H(m,v)（论文 Equation 1）：先沿 u 方向（x）做 DoG，再沿 v 方向（y）做高斯平滑
+    - 转换为 H̃(m,v)（论文 Equation 2）
+    - 计算 deform term：||(p_{i+1} - p_i) - (q_{i+1} - q_i)||^2 / r_s^2
+    - 最终权重：w_e = deform_term + α * H̃(m,v)
+    """
     theta_flatten_gpu = compute_affine_theta_vectorized(Q_i,
                                                         Q_j,
                                                         H, W).to(device)  # shape: [K_{i} * K_{i+1}, 2, 3]
@@ -270,20 +291,20 @@ def compute_weights(H: int, W: int,
                               2 * EdgeSnappingConfig.X_MAX + 1)
                      .cpu().numpy())  # change to nparray such that do tensor dot afterward
 
-    # print(f"theta_flatten_gpu: {theta_flatten_gpu.shape}")
-    # print(f"grid_gpu.shape = {grid_gpu.shape}")
-    # print(f"image_affine_and_trimmed: {image_affine_and_trimmed.shape}")
-    # print(f"fdog.shape: {EdgeSnappingConfig.fdog_kernel.shape}")
-    # print(f"gaus.shape: {EdgeSnappingConfig.gaussian_kernel.shape}")
-
+    # FDoG 滤波器实现（论文 Equation 1）：
+    # H(m,v) = ∫_{-Y}^{Y} G_σm(y) ∫_{-X}^{X} I(l(x,y)) f(x) dx dy
+    # 其中 f(x) = G_σc(x) - ρG_σs(x) 是沿 u 方向（x）的 DoG
+    # 积分顺序：先对 x（u方向，最后一维）做 DoG，再对 y（v方向，倒数第二维）做高斯平滑
     res_dot_on_x = np.tensordot(image_affined,
                                 EdgeSnappingConfig.fdog_kernel.squeeze(),
-                                axes=([-1], [0]))
+                                axes=([-1], [0]))  # 沿 u 方向（x）做 DoG
 
     res_dot_on_x_y = np.tensordot(res_dot_on_x,
                                   EdgeSnappingConfig.gaussian_kernel.squeeze(),
-                                  axes=([-1], [0])).squeeze()
+                                  axes=([-1], [0])).squeeze()  # 沿 v 方向（y）做高斯平滑
 
+    # 转换为 H̃(m,v)（论文 Equation 2）：
+    # H̃(m,v) = 1 + tanh(H(m,v)) if H(m,v) < 0, else 1
     tilde_H_response = np.where(res_dot_on_x_y < 0, 1.0 + np.tanh(res_dot_on_x_y), 1.0)
 
     # print(f"temp.shape = {res_dot_on_x.shape}, res_dot_on_x_y.shape = {res_dot_on_x_y.shape}, tilde_H.shape = {tilde_H_response.shape}")
