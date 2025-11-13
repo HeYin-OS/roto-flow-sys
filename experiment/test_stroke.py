@@ -276,17 +276,31 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         )
         buffers.snapping[i_frame] = stroke_snapping
 
+        # 光流传播：从 frame i-1 到 frame i
+        # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
+        # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
+        H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
+        
         if i == 0 or buffers.flow[i_frame - 1] is None:
             x, y = stroke_copied[:, 0], stroke_copied[:, 1]
             previous_flow = stroke_copied
         else:
             previous_flow = buffers.flow[i_frame - 1]
             x, y = previous_flow[:, 0], previous_flow[:, 1]
-        stroke_flow = previous_flow + data.flow_nhw2[i_frame - 1, y.astype(np.int32), x.astype(np.int32)]
+        
+        # 边界检查：确保索引在有效范围内
+        x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
+        y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
+        flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
+        stroke_flow = previous_flow + flow_vectors
         buffers.flow[i_frame] = stroke_flow
 
+        # fitted 传播：使用当前帧的 fitted stroke 位置采样光流
         x_fit, y_fit = stroke_copied[:, 0], stroke_copied[:, 1]
-        stroke_fitted = stroke_copied + data.flow_nhw2[i_frame - 1, y_fit.astype(np.int32), x_fit.astype(np.int32)]
+        x_fit_clipped = np.clip(x_fit.astype(np.int32), 0, W - 1)
+        y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
+        flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
+        stroke_fitted = stroke_copied + flow_vectors_fit
         stroke_fitted = local_snapping(
             stroke_fitted,
             data.images_rgb[i_frame],

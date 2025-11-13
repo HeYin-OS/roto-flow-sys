@@ -30,6 +30,15 @@ class RAFTPredictor:
         return new_width, new_height
 
     def compute_optical_flow_single(self, frame1: torch.Tensor, frame2: torch.Tensor) -> torch.Tensor:
+        """
+        计算从 frame1 到 frame2 的光流。
+        
+        返回格式：[H, W, 2]，其中：
+        - flow[:, :, 0] 是 x 方向（水平）的位移
+        - flow[:, :, 1] 是 y 方向（垂直）的位移
+        
+        语义：flow[y, x] 表示从 frame1 的位置 (x, y) 到 frame2 的位移向量 [dx, dy]
+        """
         with torch.no_grad():
             list_of_flow = self.model(frame1.unsqueeze(0).to(self.device), frame2.unsqueeze(0).to(self.device))
         return list_of_flow[-1].squeeze(0).permute(1, 2, 0).cpu()

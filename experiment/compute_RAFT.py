@@ -57,6 +57,16 @@ def read_image_for_RAFT(paths: List[Path]) -> np.ndarray:
 
 
 def compute_optical_flow_vector_fields(images_np: np.ndarray):
+    """
+    计算相邻帧之间的光流场。
+    
+    返回格式：[N-1, H, W, 2]，其中：
+    - results[i] 是从 frame i 到 frame i+1 的光流
+    - results[i, y, x, 0] 是 x 方向（水平）的位移
+    - results[i, y, x, 1] 是 y 方向（垂直）的位移
+    
+    语义：results[i, y, x] 表示从 frame i 的位置 (x, y) 到 frame i+1 的位移向量 [dx, dy]
+    """
     # if it has cache, load the cache
     cache_path = CACHE_DIR / f"{TARGET_NAME}.pt"
 
@@ -67,18 +77,19 @@ def compute_optical_flow_vector_fields(images_np: np.ndarray):
     # compute the vector fields
     images_tensor = torch.from_numpy(images_np)
 
-    frames_1_batch = images_tensor[:-1]
-    frames_2_batch = images_tensor[1:]
+    frames_1_batch = images_tensor[:-1]  # frame i
+    frames_2_batch = images_tensor[1:]    # frame i+1
 
     flow_list = []
 
     predictor = RAFTPredictor()
 
     for i in tqdm(range(frames_1_batch.shape[0]), desc="Handling frame batch:", unit="batch"):
+        # 计算从 frame i 到 frame i+1 的光流
         flow = predictor.compute_optical_flow_single(frames_1_batch[i], frames_2_batch[i])
         flow_list.append(flow)
 
-    results = torch.stack(flow_list, dim=0)
+    results = torch.stack(flow_list, dim=0)  # [N-1, H, W, 2]
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(results, str(cache_path))
