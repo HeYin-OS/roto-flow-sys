@@ -515,6 +515,19 @@ def main():
         canvas = cv2.cvtColor(context.data.images_rgb[viewer.current_frame], cv2.COLOR_RGB2BGR)
         draw_curves(canvas, context)
 
+        # 在左上角显示当前帧数
+        frame_text = f"Frame: {viewer.current_frame}/{data.images_rgb.shape[0] - 1}"
+        cv2.putText(
+            canvas,
+            frame_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
         cv2.imshow(context.env.target_name, canvas)
 
 
