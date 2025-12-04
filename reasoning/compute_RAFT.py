@@ -68,7 +68,7 @@ def compute_optical_flow_vector_fields(images_np: np.ndarray):
     语义：results[i, y, x] 表示从 frame i 的位置 (x, y) 到 frame i+1 的位移向量 [dx, dy]
     """
     # if it has cache, load the cache
-    cache_path = CACHE_DIR / f"{TARGET_NAME}.pt"
+    cache_path = CACHE_DIR / "flow" / f"{TARGET_NAME}.pt"
 
     if cache_path.exists():
         print(f"Already exists at: {cache_path}")

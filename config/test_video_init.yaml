@@ -1,3 +1,3 @@
 video:
-  url_head: "./test/images/bear"
+  url_head: "./targets/images/bear"
   format: jpg
