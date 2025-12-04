@@ -31,7 +31,7 @@ class RAFTPredictor:
 
     def compute_optical_flow_single(self, frame1: torch.Tensor, frame2: torch.Tensor) -> torch.Tensor:
         """
-        计算从 frame1 到 frame2 的光流。
+        estimate the optical flow from frame1 and frame2
         
         返回格式：[H, W, 2]，其中：
         - flow[:, :, 0] 是 x 方向（水平）的位移
@@ -77,4 +77,3 @@ class RAFTWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-# TODO: Optimize Predictor Code

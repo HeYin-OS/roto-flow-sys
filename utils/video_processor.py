@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from utils.edge_snapping import compute_all_candidates, EdgeSnappingConfig
 from utils.kd_tree import BatchKDTree
-from utils.raft_predictor import RAFTPredictor
+from reasoning.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
 

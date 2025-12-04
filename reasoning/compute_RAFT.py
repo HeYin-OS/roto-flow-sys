@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from torchvision.utils import flow_to_image
 
-from utils.raft_predictor import RAFTPredictor
+from reasoning.raft_predictor import RAFTPredictor
 from utils.yaml_reader import YamlUtil
 
 
