@@ -12,6 +12,7 @@ from utils.edge_snapping import compute_all_candidates, EdgeSnappingConfig, loca
 from utils.kd_tree import BatchKDTree
 from utils.yaml_reader import YamlUtil
 from utils.gif_writer import save_fixed_length_gif_from_bgr
+from utils.path_utils import build_project_paths as build_project_paths_from_utils, get_target_name
 
 COLOR_ORIGIN = (255, 255, 0)  # Vivid Orange
 COLOR_FLOW = (200, 130, 255)  # Soft Lavender
@@ -49,7 +50,13 @@ class StrokeEnvironment:
     def cache_file(self) -> Path:
         """Path to the optical-flow cache tensor for the current target."""
 
-        return self.paths.cache / f"{self.target_name}.pt"
+        return self.paths.cache / "flow-dilate" / f"{self.target_name}.pt"
+    
+    @property
+    def mask_erode_cache_file(self) -> Path:
+        """Path to the mask-erode cache tensor for the current target."""
+
+        return self.paths.cache / "mask-erode" / f"{self.target_name}.pt"
 
     @property
     def salient_dir(self) -> Path:
@@ -137,28 +144,36 @@ class KeyHandlerRegistry:
 def build_project_paths() -> ProjectPaths:
     """Construct an immutable `ProjectPaths` instance anchored at repo root."""
 
-    base = Path(__file__).resolve().parent.parent
+    base, config_dir, cache_dir, frame_dir, result_dir, stroke_dir = build_project_paths_from_utils()
     return ProjectPaths(
         base=base,
-        config=base / "config",
-        cache=base / "caches",
-        stroke=base / "stroke",
-        debug=base / "debug",
+        config=config_dir,
+        cache=cache_dir,
+        stroke=stroke_dir,
+        debug=base / "debug",  # debug目录独立于result_dir
     )
 
 
 def load_environment() -> StrokeEnvironment:
     """Load configuration metadata and resolve frame directory for the target."""
 
-    paths = build_project_paths()
-    config_path = paths.config / "test_video_init.yaml"
-    config_data = YamlUtil.read(str(config_path))
-    frame_dir_raw = Path(config_data['video']['url_head'])
-    frame_dir = (paths.base / frame_dir_raw).resolve() if not frame_dir_raw.is_absolute() else frame_dir_raw.resolve()
+    # 使用path_utils中的函数获取所有路径信息
+    base, config_dir, cache_dir, frame_dir, result_dir, stroke_dir = build_project_paths_from_utils()
+    target_name = get_target_name(frame_dir)
+    
+    # 构建ProjectPaths实例
+    paths = ProjectPaths(
+        base=base,
+        config=config_dir,
+        cache=cache_dir,
+        stroke=stroke_dir,
+        debug=base / "debug",  # debug目录独立于result_dir
+    )
+    
     return StrokeEnvironment(
         paths=paths,
         frame_dir=frame_dir,
-        target_name=frame_dir.name,
+        target_name=target_name,
     )
 
 
@@ -202,6 +217,55 @@ def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
     if cache_path.exists():
         return torch.load(str(cache_path))
     raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
+
+
+def read_mask_erode_cache(env: StrokeEnvironment) -> np.ndarray:
+    """Load the mask-erode cache tensor for the configured target."""
+
+    cache_path = env.mask_erode_cache_file
+    if cache_path.exists():
+        masks = torch.load(str(cache_path))
+        if isinstance(masks, torch.Tensor):
+            masks = masks.numpy()
+        return masks
+    raise ValueError(f"Mask-erode cache file does not exist: {cache_path}")
+
+
+def filter_points_by_mask(points: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    使用mask过滤点，移除物体内部的点（mask值为1的点）
+    
+    Args:
+        points: 点坐标数组，形状为(N, 2)，格式为[x, y]，值为float32
+        mask: 二值mask，形状为(H, W)，值为0或1
+    
+    Returns:
+        过滤后的点坐标数组，形状为(M, 2)，M <= N
+    """
+    if len(points) == 0:
+        return points
+    
+    H, W = mask.shape
+    
+    # 将点坐标转换为整数索引
+    x_coords = points[:, 0].astype(np.int32)
+    y_coords = points[:, 1].astype(np.int32)
+    
+    # 边界检查
+    valid_indices = (x_coords >= 0) & (x_coords < W) & (y_coords >= 0) & (y_coords < H)
+    
+    if not valid_indices.any():
+        return np.array([], dtype=np.float32).reshape(0, 2)
+    
+    # 获取mask值（物体内部为1，外部为0）
+    mask_values = np.zeros(len(points), dtype=np.float32)
+    mask_values[valid_indices] = mask[y_coords[valid_indices], x_coords[valid_indices]]
+    
+    # 过滤掉物体内部的点（mask值为1的点），只保留物体外部的点（mask值为0的点）
+    # 或者保留边界上的点（mask值在0-1之间，但这里mask是二值的，所以只保留mask=0的点）
+    filtered_indices = mask_values < 0.5
+    
+    return points[filtered_indices]
 
 
 def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[np.ndarray], height: int, width: int) -> None:
@@ -424,6 +488,30 @@ def build_runtime_context() -> RuntimeContext:
     print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
+    
+    # 使用mask-erode过滤掉物体内部的点
+    try:
+        masks_eroded = read_mask_erode_cache(env)
+        print(f"Loaded mask-erode cache: {masks_eroded.shape}, {masks_eroded.dtype}")
+        print("过滤掉物体内部的点...")
+        
+        points_all_candidates_filtered = []
+        for i in tqdm(range(len(points_all_candidates)), desc="过滤点", unit="帧"):
+            if i < masks_eroded.shape[0]:
+                mask_eroded = masks_eroded[i]
+                points_filtered = filter_points_by_mask(points_all_candidates[i], mask_eroded)
+                points_all_candidates_filtered.append(points_filtered)
+                print(f"  帧 {i}: {len(points_all_candidates[i])} -> {len(points_filtered)} 个点")
+            else:
+                # 如果mask帧数不够，使用原始点
+                points_all_candidates_filtered.append(points_all_candidates[i])
+        
+        points_all_candidates = points_all_candidates_filtered
+        print("✅ 点过滤完成")
+    except ValueError as e:
+        print(f"⚠️  警告: {e}")
+        print("   将使用未过滤的点")
+    
     generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
     kd_tree_groups = BatchKDTree(points_all_candidates)
 

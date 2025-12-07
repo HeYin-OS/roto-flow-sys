@@ -18,6 +18,14 @@ from utils.edge_snapping_utils import (
 
 
 def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
+    """
+    提取所有候选边缘点
+    
+    修改说明：
+    - 放宽局部最大值条件：从严格大于改为大于等于，允许相等的情况
+    - 添加小的容差（0.01），允许接近局部最大值的点
+    - 这样可以获得更多的候选点
+    """
     out = []
     for i_frame in tqdm(range(images_rgb_nhwc_uint8.shape[0]), desc="Computing candidate points", unit=" image(s)"):
         image_gray_hw_uint8 = cv2.cvtColor(images_rgb_nhwc_uint8[i_frame], cv2.COLOR_RGB2GRAY)
@@ -35,8 +43,11 @@ def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
         k[1, 1] = 0
         nbr_max = cv2.dilate(mag_norm, k)
 
-        # local maximum
-        local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
+        # local maximum - 放宽条件以获得更多候选点
+        # 原条件: mag_norm > nbr_max
+        # 新条件: mag_norm >= nbr_max - tolerance，允许接近局部最大值的点
+        tolerance = 0.01  # 小的容差，允许接近局部最大值的点
+        local_max = (mag_norm >= nbr_max - tolerance) & (mag_norm >= float(EdgeSnappingConfig.theta))
 
         # salient_img = local_max.astype(np.uint8) * 255
         # cv2.imwrite(f"debug/salient_points_on_frame_{i}.jpg", salient_img)
@@ -62,6 +73,8 @@ class EdgeSnappingConfig:
     candidate_num = None
     sampling_num = None
     average_weight_threshold = None
+    lambda_shape = None  # 形状约束项的权重
+    lambda_topology = None  # 拓扑顺序项的权重
 
     fdog_kernel = None
     gaussian_kernel = None
@@ -90,6 +103,8 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.candidate_num = s['candidate_num']
         EdgeSnappingConfig.sampling_num = s['sampling_num']
         EdgeSnappingConfig.average_weight_threshold = s['average_weight_threshold']
+        EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.05)  # 默认值0.05
+        EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.03)  # 默认值0.03
 
         EdgeSnappingConfig.isConfigInit = True
 
@@ -154,11 +169,19 @@ def local_snapping(stroke: np.ndarray,
 
         # weights between each two points in two groups
         p_i, p_j = stroke[i_group], stroke[i_group + 1]
+        
+        # 获取前一组候选点（用于计算形状约束和拓扑顺序）
+        prev_q_i = None
+        if i_group > 0:
+            prev_start, prev_end = flatten_index_ptr[i_group - 1], flatten_index_ptr[i_group]
+            prev_q_i = points_stroke_candidate_flatten[prev_start:prev_end]
+        
         weights = compute_weights(H, W,
                                   p_i, p_j,
                                   Q_i, Q_j,
                                   image_tensor_gray_chw,
-                                  device)  # shape: [K_i, K_j]
+                                  device,
+                                  prev_q_i=prev_q_i)  # shape: [K_i, K_j]
 
         # print(f"weights.shape: {weights.shape} ")
 
@@ -255,9 +278,10 @@ def compute_weights(H: int, W: int,
                     p_i: np.ndarray, p_j: np.ndarray,
                     Q_i: np.ndarray, Q_j: np.ndarray,
                     image_gray_chw: Tensor,
-                    device):
+                    device,
+                    prev_q_i: np.ndarray = None):
     """
-    计算边权重 w_e（论文 Equation 3）。
+    计算边权重 w_e（论文 Equation 3 + 形状约束 + 拓扑顺序）。
     
     对于每条边 e = (q_{i,k}, q_{i+1,k'})：
     - 计算中点 m = (q_{i,k} + q_{i+1,k'}) / 2
@@ -266,7 +290,12 @@ def compute_weights(H: int, W: int,
     - 应用 FDoG 滤波器 H(m,v)（论文 Equation 1）：先沿 u 方向（x）做 DoG，再沿 v 方向（y）做高斯平滑
     - 转换为 H̃(m,v)（论文 Equation 2）
     - 计算 deform term：||(p_{i+1} - p_i) - (q_{i+1} - q_i)||^2 / r_s^2
-    - 最终权重：w_e = deform_term + α * H̃(m,v)
+    - 计算 shape constraint term：形状约束项（距离和角度）
+    - 计算 topology term：拓扑顺序项（避免交叉和方向一致性）
+    - 最终权重：w_e = deform_term + α * H̃(m,v) + λ_shape * shape_term + λ_topology * topology_term
+    
+    Args:
+        prev_q_i: 前一个点的候选位置（用于计算形状约束和拓扑顺序），形状为(K_{i-1}, 2)
     """
     theta_flatten_gpu = compute_affine_theta_vectorized(Q_i,
                                                         Q_j,
@@ -322,7 +351,24 @@ def compute_weights(H: int, W: int,
     shift_j = np.sum((Q_j.astype(np.float32) - p_j[None, :]) ** 2, axis=-1)  # [K_{i+1}]
     shift_term = (shift_i[:, None] + shift_j[None, :]) / (2.0 * r_s_square)  # [K_i, K_{i+1}]
 
+    # 基础权重
     weights = deform_term + EdgeSnappingConfig.alpha * tilde_H_response
+    
+    # 形状约束项（Shape Constraint Term）
+    # 约束相邻点之间的距离和角度，保持笔画的形状一致性
+    if EdgeSnappingConfig.lambda_shape > 0:
+        shape_term = compute_shape_constraint_term(
+            p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
+        )
+        weights = weights + EdgeSnappingConfig.lambda_shape * shape_term
+    
+    # 拓扑顺序项（Topology Term）
+    # 约束点的顺序，避免交叉和方向反转
+    if EdgeSnappingConfig.lambda_topology > 0:
+        topology_term = compute_topology_term(
+            p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
+        )
+        weights = weights + EdgeSnappingConfig.lambda_topology * topology_term
 
     # print(f"p_diff.shape = {p_diff.shape}")
     # print(f"q_diff.shape = {q_diff.shape}")
@@ -333,6 +379,152 @@ def compute_weights(H: int, W: int,
     return weights
 
 
+
+
+def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
+                                  Q_i: np.ndarray, Q_j: np.ndarray,
+                                  prev_q_i: np.ndarray = None,
+                                  r_s_square: float = 400.0) -> np.ndarray:
+    """
+    计算形状约束项（Shape Constraint Term）
+    
+    约束相邻点之间的距离和角度，保持笔画的形状一致性
+    
+    Args:
+        p_i: 原始笔画点i，形状为(2,)
+        p_j: 原始笔画点j，形状为(2,)
+        Q_i: 候选点组i，形状为(K_i, 2)
+        Q_j: 候选点组j，形状为(K_j, 2)
+        prev_q_i: 前一个点的候选位置（可选），形状为(K_{i-1}, 2)
+        r_s_square: r_s的平方，用于归一化
+    
+    Returns:
+        形状约束项，形状为(K_i, K_j)
+    """
+    # 计算原始边的长度
+    p_diff = p_j - p_i  # (2,)
+    p_length = np.linalg.norm(p_diff)
+    if p_length < 1e-6:
+        p_length = 1e-6
+    
+    # 计算候选边的长度
+    q_diff = Q_j[None, :, :] - Q_i[:, None, :]  # (K_i, K_j, 2)
+    q_length = np.linalg.norm(q_diff, axis=-1)  # (K_i, K_j)
+    
+    # 距离约束：保持相邻点之间的距离接近原始距离
+    # 惩罚与原始距离差异较大的情况
+    length_diff = np.abs(q_length - p_length) / p_length
+    length_term = length_diff * length_diff  # (K_i, K_j)
+    
+    # 角度约束：如果有前一个点，约束角度变化
+    angle_term = np.zeros((Q_i.shape[0], Q_j.shape[0]), dtype=np.float32)
+    
+    if prev_q_i is not None and len(prev_q_i) > 0:
+        # 使用前一组候选点的平均位置作为参考（简化处理）
+        prev_q_mean = np.mean(prev_q_i, axis=0)  # (2,)
+        
+        # 计算前一个边到当前边的角度变化
+        # 前一个边：prev_q_mean -> Q_i
+        prev_edge = Q_i - prev_q_mean[None, :]  # (K_i, 2)
+        prev_edge_length = np.linalg.norm(prev_edge, axis=-1, keepdims=True)  # (K_i, 1)
+        prev_edge_normalized = prev_edge / (prev_edge_length + 1e-6)  # (K_i, 2)
+        
+        # 当前边的方向
+        curr_edge_normalized = q_diff / (q_length[:, :, None] + 1e-6)  # (K_i, K_j, 2)
+        
+        # 计算角度变化（使用点积）
+        cos_angle = np.sum(prev_edge_normalized[:, None, :] * curr_edge_normalized, axis=-1)  # (K_i, K_j)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        
+        # 角度变化惩罚（角度变化越大，惩罚越大）
+        angle_diff = 1.0 - cos_angle  # 0表示角度相同，2表示完全相反
+        angle_term = angle_diff * angle_diff
+    
+    # 综合形状约束项
+    shape_term = length_term + 0.5 * angle_term
+    
+    return shape_term
+
+
+def compute_topology_term(p_i: np.ndarray, p_j: np.ndarray,
+                         Q_i: np.ndarray, Q_j: np.ndarray,
+                         prev_q_i: np.ndarray = None,
+                         r_s_square: float = 400.0) -> np.ndarray:
+    """
+    计算拓扑顺序项（Topology Term）
+    
+    约束点的顺序，避免交叉和方向反转
+    
+    Args:
+        p_i: 原始笔画点i，形状为(2,)
+        p_j: 原始笔画点j，形状为(2,)
+        Q_i: 候选点组i，形状为(K_i, 2)
+        Q_j: 候选点组j，形状为(K_j, 2)
+        prev_q_i: 前一个点的候选位置（可选），形状为(K_{i-1}, 2)
+        r_s_square: r_s的平方，用于归一化
+    
+    Returns:
+        拓扑顺序项，形状为(K_i, K_j)
+    """
+    topology_term = np.zeros((Q_i.shape[0], Q_j.shape[0]), dtype=np.float32)
+    
+    # 计算原始边的方向
+    p_diff = p_j - p_i  # (2,)
+    p_length = np.linalg.norm(p_diff)
+    if p_length < 1e-6:
+        return topology_term
+    p_direction = p_diff / p_length  # (2,)
+    
+    # 计算候选边的方向
+    q_diff = Q_j[None, :, :] - Q_i[:, None, :]  # (K_i, K_j, 2)
+    q_length = np.linalg.norm(q_diff, axis=-1, keepdims=True)  # (K_i, K_j, 1)
+    q_direction = q_diff / (q_length + 1e-6)  # (K_i, K_j, 2)
+    
+    # 方向一致性约束：候选边的方向应该与原始边的方向一致
+    # 使用点积来衡量方向一致性
+    direction_consistency = np.sum(p_direction[None, None, :] * q_direction, axis=-1)  # (K_i, K_j)
+    # 方向一致性项：方向越不一致，惩罚越大
+    direction_term = (1.0 - direction_consistency) * (1.0 - direction_consistency)  # (K_i, K_j)
+    
+    # 交叉检测：如果有前一个点，检测边是否交叉
+    cross_term = np.zeros((Q_i.shape[0], Q_j.shape[0]), dtype=np.float32)
+    
+    if prev_q_i is not None and len(prev_q_i) > 0:
+        # 使用前一组候选点的平均位置作为参考
+        prev_q_mean = np.mean(prev_q_i, axis=0)  # (2,)
+        
+        # 前一个边：prev_q_mean -> Q_i
+        prev_edge = Q_i - prev_q_mean[None, :]  # (K_i, 2)
+        prev_edge_length = np.linalg.norm(prev_edge, axis=-1, keepdims=True)  # (K_i, 1)
+        prev_edge_norm = prev_edge / (prev_edge_length + 1e-6)  # (K_i, 2)
+        
+        # 扩展 prev_edge_norm 以匹配 q_direction 的形状 (K_i, K_j, 2)
+        prev_edge_norm_expanded = prev_edge_norm[:, None, :]  # (K_i, 1, 2)
+        
+        # 计算转向角度（叉积的符号表示转向方向）
+        # 如果转向角度过大（接近180度），说明可能交叉
+        cross_product = (prev_edge_norm_expanded[:, :, 0:1] * q_direction[:, :, 1:2] - 
+                       prev_edge_norm_expanded[:, :, 1:2] * q_direction[:, :, 0:1])  # (K_i, K_j, 1)
+        cross_product = cross_product.squeeze(-1)  # (K_i, K_j)
+        
+        # 转向角度过大时给予惩罚
+        # 使用转向角度的绝对值
+        turn_angle = np.abs(cross_product)
+        cross_term = np.where(turn_angle > 0.8, turn_angle * turn_angle, 0.0)  # 阈值0.8约等于90度
+    
+    # 顺序约束：确保点按顺序排列（Q_j应该在Q_i的前进方向上）
+    # 计算Q_j相对于Q_i的位置是否在前进方向上
+    q_relative_dir = q_direction  # 已经归一化
+    
+    # 检查是否在前进方向上（点积应该为正）
+    forward_check = np.sum(p_direction[None, None, :] * q_relative_dir, axis=-1)  # (K_i, K_j)
+    # 如果不在前进方向（点积为负），给予惩罚
+    order_term = np.where(forward_check < 0, forward_check * forward_check, 0.0)  # (K_i, K_j)
+    
+    # 综合拓扑顺序项
+    topology_term = direction_term + 0.3 * cross_term + 0.2 * order_term
+    
+    return topology_term
 
 
 def compute_affine_theta_vectorized(Q_i: np.ndarray,
