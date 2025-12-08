@@ -30,6 +30,7 @@ class ProjectPaths:
     cache: Path
     stroke: Path
     debug: Path
+    result: Path
 
 
 @dataclass(frozen=True)
@@ -62,13 +63,13 @@ class StrokeEnvironment:
     def salient_dir(self) -> Path:
         """Directory used to dump candidate salient points for debugging."""
 
-        return self.paths.debug / "salient" / self.target_name
+        return self.paths.result / "salient" / self.target_name
 
     @property
     def salient_stroke_dir(self) -> Path:
         """Directory used to dump salient stroke groups for debugging."""
 
-        return self.paths.debug / "salient_stroke" / self.target_name
+        return self.paths.result / "salient" / self.target_name
 
 
 @dataclass
@@ -151,6 +152,7 @@ def build_project_paths() -> ProjectPaths:
         cache=cache_dir,
         stroke=stroke_dir,
         debug=base / "debug",  # debug目录独立于result_dir
+        result=result_dir,  # results目录
     )
 
 
@@ -168,6 +170,7 @@ def load_environment() -> StrokeEnvironment:
         cache=cache_dir,
         stroke=stroke_dir,
         debug=base / "debug",  # debug目录独立于result_dir
+        result=result_dir,  # results目录
     )
     
     return StrokeEnvironment(
@@ -424,7 +427,7 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     data = context.data
     buffers = context.buffers
     n_frame = data.images_rgb.shape[0]
-    target_dir = env.paths.debug / "results" / env.target_name
+    target_dir = env.paths.result / "final" / env.target_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
     stroke_categories = (

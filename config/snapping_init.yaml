@@ -2,7 +2,7 @@ snapping:
   theta: 0.25
   alpha: 0.1
   beta: 0.5
-  beta_shift: 0.25
+  beta_shift: 0.2
   sigma_c: 1.0
   sigma_s: 1.6
   sigma_m: 3.0
