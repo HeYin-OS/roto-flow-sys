@@ -889,7 +889,7 @@ def compute_velocity_term(prev_p_i: np.ndarray, prev_p_j: np.ndarray,
     # 强化版速度项：使用分段惩罚函数
     # 阈值：r_s（搜索半径）作为分界点
     r_s = np.sqrt(r_s_square)
-    threshold = r_s * 0.5  # 使用r_s的一半作为阈值
+    threshold = r_s * 0.3  # 降低阈值，使速度约束更敏感，抑制摆动
     
     # 对于点i：小位移线性惩罚，大位移平方惩罚
     velocity_i = np.where(
@@ -911,7 +911,7 @@ def compute_velocity_term(prev_p_i: np.ndarray, prev_p_j: np.ndarray,
     
     # 添加交叉项：如果两个点的位移都超过阈值，给予额外惩罚
     both_large = (displacement_i_norm[:, None] > threshold) & (displacement_j_norm[None, :] > threshold)
-    cross_penalty = np.where(both_large, 0.5, 0.0)  # 额外惩罚
+    cross_penalty = np.where(both_large, 1.0, 0.0)  # 增强交叉惩罚，抑制摆动
     velocity_term = velocity_term + cross_penalty
     
     return velocity_term
@@ -953,23 +953,33 @@ def compute_length_term(p_i: np.ndarray, p_j: np.ndarray,
     edge_length_diff = np.abs(q_edge_length - p_edge_length) / p_edge_length  # (K_i, K_j)
     
     # 基础长度约束：惩罚与原始边长度差异较大的情况
+    # 使用平方惩罚，但对小差异更宽容
     length_term = edge_length_diff * edge_length_diff  # (K_i, K_j)
     
     # 如果有前一帧的长度信息，添加时间连续性约束
-    if prev_stroke_total_length is not None and prev_stroke_total_length > 1e-6:
-        # 计算如果选择该边，估计的总长度变化
-        # 假设其他边保持不变，该边的变化会导致总长度变化
-        estimated_total_length = prev_stroke_total_length - p_edge_length + q_edge_length
-        total_length_ratio = estimated_total_length / prev_stroke_total_length
+    # 但主要参考应该是原始stroke的长度，而不是前一帧的吸附结果
+    if prev_stroke_total_length is not None and prev_stroke_total_length > 1e-6 and stroke_total_length > 1e-6:
+        # 使用原始stroke长度作为主要参考
+        # 计算如果选择该边，估计的总长度变化（相对于原始长度）
+        estimated_total_length = stroke_total_length - p_edge_length + q_edge_length
+        total_length_ratio_to_original = estimated_total_length / stroke_total_length
         
-        # 惩罚总长度变化过大的情况（超过20%的变化）
+        # 惩罚总长度变化：相对于原始长度，使用适中的阈值（15%）
         length_change_penalty = np.where(
-            (total_length_ratio < 0.8) | (total_length_ratio > 1.2),
-            (total_length_ratio - 1.0) ** 2 * 2.0,  # 对超过20%的变化给予强惩罚
+            (total_length_ratio_to_original < 0.85) | (total_length_ratio_to_original > 1.15),
+            (total_length_ratio_to_original - 1.0) ** 2 * 3.0,  # 对过大变化给予惩罚
             0.0
         )
         
-        length_term = length_term + length_change_penalty
+        # 时间连续性：相对于前一帧，给予轻微约束（但不作为主要约束）
+        total_length_ratio_to_prev = estimated_total_length / prev_stroke_total_length
+        temporal_penalty = np.where(
+            (total_length_ratio_to_prev < 0.9) | (total_length_ratio_to_prev > 1.1),
+            (total_length_ratio_to_prev - 1.0) ** 2 * 1.0,  # 轻微的时间连续性约束
+            0.0
+        )
+        
+        length_term = length_term + length_change_penalty + temporal_penalty
     
     return length_term
 
