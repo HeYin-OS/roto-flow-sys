@@ -54,10 +54,10 @@ class StrokeEnvironment:
         return self.paths.cache / "flow-dilate" / f"{self.target_name}.pt"
     
     @property
-    def mask_erode_cache_file(self) -> Path:
-        """Path to the mask-erode cache tensor for the current target."""
+    def mask_cache_file(self) -> Path:
+        """Path to the original mask cache tensor for the current target."""
 
-        return self.paths.cache / "mask-erode" / f"{self.target_name}.pt"
+        return self.paths.cache / "mask" / f"{self.target_name}.pt"
 
     @property
     def salient_dir(self) -> Path:
@@ -77,7 +77,7 @@ class ViewerState:
     """Mutable UI state controlled by keyboard shortcuts."""
 
     current_frame: int = 0
-    current_stroke_index: int = 0
+    current_stroke_index: int = 2  # 默认使用3号stroke（索引从0开始，3号对应索引2）
     show_origin: bool = True
     show_flow: bool = False
     show_snapping: bool = False
@@ -106,7 +106,8 @@ class StrokeData:
 
     images_rgb: np.ndarray
     flow_nhw2: np.ndarray
-    kd_tree: BatchKDTree
+    kd_tree: BatchKDTree  # 使用过滤后的候选点
+    kd_tree_unfiltered: BatchKDTree = None  # 使用未过滤的候选点（用于纯光流和纯吸附）
 
 
 @dataclass
@@ -222,25 +223,80 @@ def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
     raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
 
 
-def read_mask_erode_cache(env: StrokeEnvironment) -> np.ndarray:
-    """Load the mask-erode cache tensor for the configured target."""
+def read_mask_cache(env: StrokeEnvironment) -> np.ndarray:
+    """Load the original mask cache tensor for the configured target."""
 
-    cache_path = env.mask_erode_cache_file
+    cache_path = env.mask_cache_file
     if cache_path.exists():
         masks = torch.load(str(cache_path))
         if isinstance(masks, torch.Tensor):
             masks = masks.numpy()
         return masks
-    raise ValueError(f"Mask-erode cache file does not exist: {cache_path}")
+    raise ValueError(f"Mask cache file does not exist: {cache_path}")
 
 
-def filter_points_by_mask(points: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def erode_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
     """
-    使用mask过滤点，移除物体内部的点（mask值为1的点）
+    对mask进行形态学腐蚀
+    
+    Args:
+        mask: 二值mask，形状为(H, W)，值为0或1
+        kernel_size: 腐蚀核大小（像素宽度）
+    
+    Returns:
+        腐蚀后的mask
+    """
+    # 确保mask是uint8类型
+    if mask.dtype != np.uint8:
+        mask_uint8 = (mask * 255).astype(np.uint8)
+    else:
+        mask_uint8 = mask
+    
+    # 创建圆形结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    
+    # 执行腐蚀操作
+    eroded = cv2.erode(mask_uint8, kernel, iterations=1)
+    
+    # 转换回0-1范围
+    return (eroded / 255.0).astype(np.float32)
+
+
+def dilate_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    """
+    对mask进行形态学膨胀
+    
+    Args:
+        mask: 二值mask，形状为(H, W)，值为0或1
+        kernel_size: 膨胀核大小（像素宽度）
+    
+    Returns:
+        膨胀后的mask
+    """
+    # 确保mask是uint8类型
+    if mask.dtype != np.uint8:
+        mask_uint8 = (mask * 255).astype(np.uint8)
+    else:
+        mask_uint8 = mask
+    
+    # 创建圆形结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    
+    # 执行膨胀操作
+    dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
+    
+    # 转换回0-1范围
+    return (dilated / 255.0).astype(np.float32)
+
+
+def filter_points_by_mask(points: np.ndarray, mask: np.ndarray, keep_inside: bool = False) -> np.ndarray:
+    """
+    使用mask过滤点
     
     Args:
         points: 点坐标数组，形状为(N, 2)，格式为[x, y]，值为float32
         mask: 二值mask，形状为(H, W)，值为0或1
+        keep_inside: 如果为True，保留mask内部的点（mask值为1的点）；如果为False，保留mask外部的点（mask值为0的点）
     
     Returns:
         过滤后的点坐标数组，形状为(M, 2)，M <= N
@@ -264,9 +320,13 @@ def filter_points_by_mask(points: np.ndarray, mask: np.ndarray) -> np.ndarray:
     mask_values = np.zeros(len(points), dtype=np.float32)
     mask_values[valid_indices] = mask[y_coords[valid_indices], x_coords[valid_indices]]
     
-    # 过滤掉物体内部的点（mask值为1的点），只保留物体外部的点（mask值为0的点）
-    # 或者保留边界上的点（mask值在0-1之间，但这里mask是二值的，所以只保留mask=0的点）
-    filtered_indices = mask_values < 0.5
+    # 根据keep_inside参数决定保留哪些点
+    if keep_inside:
+        # 保留mask内部的点（mask值为1的点）
+        filtered_indices = mask_values > 0.5
+    else:
+        # 保留mask外部的点（mask值为0的点）
+        filtered_indices = mask_values < 0.5
     
     return points[filtered_indices]
 
@@ -312,6 +372,7 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
         stroke_0,
         data.images_rgb[0],
         points_stroke_candidate,
+        previous_snapped_stroke=None,  # 第一帧没有前一帧
     )
     buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
@@ -326,7 +387,8 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         if stroke_copied is None:
             raise RuntimeError(f"Missing fitted stroke for frame {i_frame - 1}")
 
-        points_stroke_candidate = data.kd_tree.query_batch(
+        # 使用未过滤的候选点进行纯吸附传播
+        points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
             i_frame,
             stroke_copied,
             EdgeSnappingConfig.r_s,
@@ -334,12 +396,15 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
 
         if i == 0 or buffers.snapping[i_frame - 1] is None:
             previous_snapping = stroke_copied
+            previous_snapped_stroke = None  # 第一帧没有前一帧
         else:
             previous_snapping = buffers.snapping[i_frame - 1]
+            previous_snapped_stroke = buffers.snapping[i_frame - 1]  # 用于速度约束
         stroke_snapping = local_snapping(
             previous_snapping,
             data.images_rgb[i_frame],
-            points_stroke_candidate,
+            points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
+            previous_snapped_stroke=previous_snapped_stroke,
         )
         buffers.snapping[i_frame] = stroke_snapping
 
@@ -368,10 +433,21 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
         flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
         stroke_fitted = stroke_copied + flow_vectors_fit
+        # 使用过滤后的候选点进行fitted传播
+        points_stroke_candidate_fitted = data.kd_tree.query_batch(
+            i_frame,
+            stroke_fitted,
+            EdgeSnappingConfig.r_s,
+        )
+        # 获取前一帧的fitted结果用于速度约束
+        previous_fitted_stroke = None
+        if i > 0 and buffers.fitted[i_frame - 1] is not None:
+            previous_fitted_stroke = buffers.fitted[i_frame - 1]
         stroke_fitted = local_snapping(
             stroke_fitted,
             data.images_rgb[i_frame],
-            points_stroke_candidate,
+            points_stroke_candidate_fitted,  # 使用过滤后的候选点
+            previous_snapped_stroke=previous_fitted_stroke,
         )
         buffers.fitted[i_frame] = stroke_fitted
 
@@ -492,36 +568,61 @@ def build_runtime_context() -> RuntimeContext:
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
     
-    # 使用mask-erode过滤掉物体内部的点
+    # 保存未过滤的候选点（用于纯光流和纯吸附）
+    # 使用列表推导式深拷贝每个numpy数组
+    points_all_candidates_unfiltered = [points.copy() for points in points_all_candidates]
+    
+    # 使用原始mask进行双重过滤：
+    # 1. 腐蚀3个像素，过滤掉物体内部的点
+    # 2. 膨胀3个像素，过滤掉物体外部的点
+    # 最终保留的点：在膨胀mask内部，但不在腐蚀mask内部的点（边界区域）
     try:
-        masks_eroded = read_mask_erode_cache(env)
-        print(f"Loaded mask-erode cache: {masks_eroded.shape}, {masks_eroded.dtype}")
-        print("过滤掉物体内部的点...")
+        masks_original = read_mask_cache(env)
+        print(f"Loaded original mask cache: {masks_original.shape}, {masks_original.dtype}")
+        # print("使用原始mask进行双重过滤（腐蚀3像素过滤内部点，膨胀3像素过滤外部点）...")
+        
+        erode_size = 3
+        dilate_size = 3
         
         points_all_candidates_filtered = []
-        for i in tqdm(range(len(points_all_candidates)), desc="过滤点", unit="帧"):
-            if i < masks_eroded.shape[0]:
-                mask_eroded = masks_eroded[i]
-                points_filtered = filter_points_by_mask(points_all_candidates[i], mask_eroded)
+        for i in tqdm(range(len(points_all_candidates)), desc="Filtering Salient Points", unit=" frame(s)"):
+            if i < masks_original.shape[0]:
+                mask_original = masks_original[i]
+                
+                # 对原始mask进行腐蚀（用于过滤内部点）
+                mask_eroded = erode_mask(mask_original, erode_size)
+                
+                # 对原始mask进行膨胀（用于过滤外部点）
+                mask_dilated = dilate_mask(mask_original, dilate_size)
+                
+                # 第一步：使用腐蚀mask过滤掉物体内部的点（保留外部点）
+                points_after_erode = filter_points_by_mask(points_all_candidates[i], mask_eroded, keep_inside=False)
+                
+                # 第二步：使用膨胀mask过滤掉物体外部的点（保留内部点）
+                points_filtered = filter_points_by_mask(points_after_erode, mask_dilated, keep_inside=True)
+                
                 points_all_candidates_filtered.append(points_filtered)
-                print(f"  帧 {i}: {len(points_all_candidates[i])} -> {len(points_filtered)} 个点")
+                # print(f"  帧 {i}: {len(points_all_candidates[i])} -> {len(points_after_erode)} (腐蚀后) -> {len(points_filtered)} (最终) 个点")
             else:
                 # 如果mask帧数不够，使用原始点
                 points_all_candidates_filtered.append(points_all_candidates[i])
         
         points_all_candidates = points_all_candidates_filtered
-        print("✅ 点过滤完成")
+        # print("✅ 点过滤完成")
     except ValueError as e:
         print(f"⚠️  警告: {e}")
         print("   将使用未过滤的点")
     
     generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
     kd_tree_groups = BatchKDTree(points_all_candidates)
+    # 为未过滤的候选点创建 kd_tree（用于纯光流和纯吸附）
+    kd_tree_groups_unfiltered = BatchKDTree(points_all_candidates_unfiltered)
 
     data = StrokeData(
         images_rgb=images_rgb_nhwc_uint8,
         flow_nhw2=flow_nhw2_float32,
         kd_tree=kd_tree_groups,
+        kd_tree_unfiltered=kd_tree_groups_unfiltered,
     )
 
     buffers = StrokeBuffers()

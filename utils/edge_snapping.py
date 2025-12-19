@@ -75,6 +75,9 @@ class EdgeSnappingConfig:
     average_weight_threshold = None
     lambda_shape = None  # 形状约束项的权重
     lambda_topology = None  # 拓扑顺序项的权重
+    lambda_deform = None  # 形变项的权重（用于增强形变控制）
+    lambda_velocity = None  # 速度项的权重（防止过大的位移）
+    lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）
 
     fdog_kernel = None
     gaussian_kernel = None
@@ -103,8 +106,11 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.candidate_num = s['candidate_num']
         EdgeSnappingConfig.sampling_num = s['sampling_num']
         EdgeSnappingConfig.average_weight_threshold = s['average_weight_threshold']
-        EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.05)  # 默认值0.05
-        EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.03)  # 默认值0.03
+        EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.1)  # 默认值0.1
+        EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.15)  # 默认值0.15
+        EdgeSnappingConfig.lambda_deform = s.get('lambda_deform', 1.0)  # 默认值1.0
+        EdgeSnappingConfig.lambda_velocity = s.get('lambda_velocity', 0.5)  # 默认值0.5（强化后的默认值）
+        EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2
 
         EdgeSnappingConfig.isConfigInit = True
 
@@ -124,7 +130,8 @@ class EdgeSnappingConfig:
 
 def local_snapping(stroke: np.ndarray,
                    image_rgb_hwc: np.ndarray,
-                   points_stroke_candidate: List[np.ndarray]):
+                   points_stroke_candidate: List[np.ndarray],
+                   previous_snapped_stroke: np.ndarray = None):
     """
     局部优化步骤：将用户笔画吸附到图像边缘特征上。
     
@@ -132,6 +139,12 @@ def local_snapping(stroke: np.ndarray,
     1. 构建链状图 G = (V, E)，其中 V = U_0^N Q_i（Q_0 为虚拟起始点，通过将第一组能量设为0实现）
     2. 对每条边 e = (q_{i,k}, q_{i+1,k'}) 计算权重 w_e（Equation 3）
     3. 使用动态规划找最短路径（对应论文中的 s'_1）
+    
+    Args:
+        stroke: 当前帧的原始笔画，形状为(N, 2)
+        image_rgb_hwc: 当前帧的RGB图像，形状为(H, W, 3)
+        points_stroke_candidate: 候选点列表
+        previous_snapped_stroke: 前一帧的吸附结果，形状为(N, 2)，用于计算速度约束
     """
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
@@ -150,6 +163,20 @@ def local_snapping(stroke: np.ndarray,
     # order to xy and get point number of stroke
     stroke_len = stroke.shape[0]
     stroke = stroke.astype(np.float32)
+    
+    # 计算原始stroke的总长度（用于长度约束）
+    stroke_total_length = 0.0
+    for i in range(stroke_len - 1):
+        edge_length = np.linalg.norm(stroke[i + 1] - stroke[i])
+        stroke_total_length += edge_length
+    
+    # 计算前一帧的总长度（用于长度约束）
+    prev_stroke_total_length = None
+    if previous_snapped_stroke is not None and len(previous_snapped_stroke) > 1:
+        prev_stroke_total_length = 0.0
+        for i in range(len(previous_snapped_stroke) - 1):
+            edge_length = np.linalg.norm(previous_snapped_stroke[i + 1] - previous_snapped_stroke[i])
+            prev_stroke_total_length += edge_length
 
     # ready for dp
     # energy -> accumulated energy for each candidate point
@@ -176,35 +203,305 @@ def local_snapping(stroke: np.ndarray,
             prev_start, prev_end = flatten_index_ptr[i_group - 1], flatten_index_ptr[i_group]
             prev_q_i = points_stroke_candidate_flatten[prev_start:prev_end]
         
+        # 获取前一帧对应点的位置（用于速度约束）
+        prev_p_i = None
+        prev_p_j = None
+        if previous_snapped_stroke is not None and i_group < len(previous_snapped_stroke) and i_group + 1 < len(previous_snapped_stroke):
+            prev_p_i = previous_snapped_stroke[i_group]
+            prev_p_j = previous_snapped_stroke[i_group + 1]
+        
         weights = compute_weights(H, W,
                                   p_i, p_j,
                                   Q_i, Q_j,
                                   image_tensor_gray_chw,
                                   device,
-                                  prev_q_i=prev_q_i)  # shape: [K_i, K_j]
+                                  prev_q_i=prev_q_i,
+                                  prev_p_i=prev_p_i,
+                                  prev_p_j=prev_p_j,
+                                  stroke_total_length=stroke_total_length,
+                                  prev_stroke_total_length=prev_stroke_total_length)  # shape: [K_i, K_j]
 
         # print(f"weights.shape: {weights.shape} ")
 
         dp_energy_iteration(i_group, flatten_index_ptr, energy, prev, weights)
 
-    return pick_best_path(last_start=flatten_index_ptr[-2],
-                          last_end=flatten_index_ptr[-1],
-                          energy=energy,
-                          prev=prev,
-                          candidates_flatten=points_stroke_candidate_flatten,
-                          stroke=stroke,
-                          average_weight_standard=EdgeSnappingConfig.average_weight_threshold,
-                          average_distance_standard=EdgeSnappingConfig.r_s / 4.0)
+    snapped_stroke = pick_best_path(last_start=flatten_index_ptr[-2],
+                                    last_end=flatten_index_ptr[-1],
+                                    energy=energy,
+                                    prev=prev,
+                                    candidates_flatten=points_stroke_candidate_flatten,
+                                    stroke=stroke,
+                                    average_weight_standard=EdgeSnappingConfig.average_weight_threshold,
+                                    average_distance_standard=EdgeSnappingConfig.r_s / 4.0)
+    
+    # 检查并修复拓扑结构
+    snapped_stroke = check_and_fix_topology(snapped_stroke, stroke)
+    
+    return snapped_stroke
+
+
+def check_and_fix_topology(snapped_stroke: np.ndarray, original_stroke: np.ndarray) -> np.ndarray:
+    """
+    检查吸附后笔画的拓扑结构，并修复拓扑问题（交叉、方向反转等）
+    
+    Args:
+        snapped_stroke: 吸附后的笔画，形状为(N, 2)
+        original_stroke: 原始笔画，形状为(N, 2)，用于参考
+    
+    Returns:
+        修复后的笔画，形状为(N, 2)
+    """
+    if len(snapped_stroke) < 3:
+        # 点数太少，无法检查拓扑
+        return snapped_stroke
+    
+    # 检查是否有交叉
+    has_crossing = detect_crossings(snapped_stroke)
+    
+    # 检查方向一致性
+    direction_issues = detect_direction_issues(snapped_stroke, original_stroke)
+    
+    # 如果检测到拓扑问题，进行修复
+    if has_crossing or direction_issues:
+        fixed_stroke = fix_topology_issues(snapped_stroke, original_stroke, has_crossing, direction_issues)
+        return fixed_stroke
+    
+    return snapped_stroke
+
+
+def detect_crossings(stroke: np.ndarray) -> bool:
+    """
+    检测笔画中是否有边交叉
+    
+    Args:
+        stroke: 笔画点数组，形状为(N, 2)
+    
+    Returns:
+        是否存在交叉
+    """
+    n = len(stroke)
+    if n < 4:
+        return False
+    
+    # 检查相邻的边是否交叉
+    for i in range(n - 3):
+        p1 = stroke[i]
+        p2 = stroke[i + 1]
+        
+        for j in range(i + 2, n - 1):
+            p3 = stroke[j]
+            p4 = stroke[j + 1]
+            
+            # 使用叉积检测线段是否相交
+            if segments_intersect(p1, p2, p3, p4):
+                return True
+    
+    return False
+
+
+def segments_intersect(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> bool:
+    """
+    检测两条线段是否相交（使用叉积方法）
+    
+    Args:
+        p1, p2: 第一条线段的端点
+        p3, p4: 第二条线段的端点
+    
+    Returns:
+        是否相交
+    """
+    def ccw(A, B, C):
+        """判断三点是否逆时针排列"""
+        return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+    
+    # 两条线段相交当且仅当：
+    # (p1, p2, p3) 和 (p1, p2, p4) 的方向不同，且
+    # (p3, p4, p1) 和 (p3, p4, p2) 的方向不同
+    return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
+
+
+def detect_direction_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray) -> bool:
+    """
+    检测方向问题（点是否按正确顺序排列）
+    
+    Args:
+        snapped_stroke: 吸附后的笔画
+        original_stroke: 原始笔画
+    
+    Returns:
+        是否存在方向问题
+    """
+    if len(snapped_stroke) < 2 or len(original_stroke) < 2:
+        return False
+    
+    # 计算原始笔画的总方向
+    original_dir = original_stroke[-1] - original_stroke[0]
+    original_length = np.linalg.norm(original_dir)
+    
+    if original_length < 1e-6:
+        return False
+    
+    original_dir_normalized = original_dir / original_length
+    
+    # 计算吸附后笔画的总方向
+    snapped_dir = snapped_stroke[-1] - snapped_stroke[0]
+    snapped_length = np.linalg.norm(snapped_dir)
+    
+    if snapped_length < 1e-6:
+        return False
+    
+    snapped_dir_normalized = snapped_dir / snapped_length
+    
+    # 检查方向是否一致（点积应该接近1）
+    direction_consistency = np.dot(original_dir_normalized, snapped_dir_normalized)
+    
+    # 如果方向一致性小于0.5，认为有方向问题
+    if direction_consistency < 0.5:
+        return True
+    
+    # 检查局部方向是否频繁反转
+    reversal_count = 0
+    for i in range(len(snapped_stroke) - 2):
+        edge1 = snapped_stroke[i + 1] - snapped_stroke[i]
+        edge2 = snapped_stroke[i + 2] - snapped_stroke[i + 1]
+        
+        if np.linalg.norm(edge1) > 1e-6 and np.linalg.norm(edge2) > 1e-6:
+            edge1_norm = edge1 / np.linalg.norm(edge1)
+            edge2_norm = edge2 / np.linalg.norm(edge2)
+            dot_product = np.dot(edge1_norm, edge2_norm)
+            
+            # 如果相邻边的方向相反（点积为负），计数
+            if dot_product < -0.3:
+                reversal_count += 1
+    
+    # 如果反转次数超过总边数的20%，认为有方向问题
+    if reversal_count > (len(snapped_stroke) - 2) * 0.2:
+        return True
+    
+    return False
+
+
+def fix_topology_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray, 
+                       has_crossing: bool, has_direction_issue: bool) -> np.ndarray:
+    """
+    修复拓扑问题
+    
+    Args:
+        snapped_stroke: 吸附后的笔画
+        original_stroke: 原始笔画
+        has_crossing: 是否有交叉
+        has_direction_issue: 是否有方向问题
+    
+    Returns:
+        修复后的笔画
+    """
+    fixed_stroke = snapped_stroke.copy()
+    
+    # 如果有方向问题，尝试反转部分点
+    if has_direction_issue:
+        # 计算每个点相对于原始笔画的位置
+        # 如果整体方向相反，反转整个笔画
+        original_dir = original_stroke[-1] - original_stroke[0]
+        snapped_dir = fixed_stroke[-1] - fixed_stroke[0]
+        
+        if np.dot(original_dir, snapped_dir) < 0:
+            # 方向相反，反转整个笔画
+            fixed_stroke = fixed_stroke[::-1]
+    
+    # 如果有交叉，尝试平滑处理
+    if has_crossing:
+        # 使用简单的平滑来减少交叉
+        # 对每个点，计算其与相邻点的平均位置
+        smoothed = fixed_stroke.copy()
+        for i in range(1, len(fixed_stroke) - 1):
+            # 使用加权平均：当前点权重0.6，相邻点各0.2
+            smoothed[i] = 0.6 * fixed_stroke[i] + 0.2 * fixed_stroke[i - 1] + 0.2 * fixed_stroke[i + 1]
+        fixed_stroke = smoothed
+    
+    # 确保点之间的距离不会太短或太长
+    fixed_stroke = enforce_minimum_distance(fixed_stroke, original_stroke)
+    
+    return fixed_stroke
+
+
+def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) -> np.ndarray:
+    """
+    确保点之间的距离合理（不会太短或太长）
+    
+    Args:
+        stroke: 笔画点数组
+        original_stroke: 原始笔画（用于参考距离）
+    
+    Returns:
+        调整后的笔画
+    """
+    if len(stroke) < 2:
+        return stroke
+    
+    # 计算原始笔画的平均边长度
+    original_lengths = []
+    for i in range(len(original_stroke) - 1):
+        length = np.linalg.norm(original_stroke[i + 1] - original_stroke[i])
+        if length > 1e-6:
+            original_lengths.append(length)
+    
+    if len(original_lengths) == 0:
+        return stroke
+    
+    avg_length = np.mean(original_lengths)
+    min_length = avg_length * 0.3  # 最小距离为平均距离的30%
+    max_length = avg_length * 3.0  # 最大距离为平均距离的3倍
+    
+    fixed_stroke = stroke.copy()
+    
+    # 检查并调整过短或过长的边
+    i = 0
+    while i < len(fixed_stroke) - 1:
+        edge = fixed_stroke[i + 1] - fixed_stroke[i]
+        length = np.linalg.norm(edge)
+        
+        if length < min_length and length > 1e-6:
+            # 边太短，移除中间的点（如果存在）或调整位置
+            if i + 1 < len(fixed_stroke) - 1:
+                # 合并到下一个点
+                fixed_stroke = np.delete(fixed_stroke, i + 1, axis=0)
+                continue
+        elif length > max_length:
+            # 边太长，在中间插入点
+            num_insert = int(length / avg_length)
+            if num_insert > 1:
+                new_points = []
+                for j in range(1, num_insert):
+                    t = j / num_insert
+                    new_point = fixed_stroke[i] * (1 - t) + fixed_stroke[i + 1] * t
+                    new_points.append(new_point)
+                if new_points:
+                    fixed_stroke = np.insert(fixed_stroke, i + 1, new_points, axis=0)
+                    i += len(new_points)
+        
+        i += 1
+    
+    return fixed_stroke
 
 
 def candidate_point_sets_defense(points_candidate: list[np.ndarray], stroke: np.ndarray) -> list[np.ndarray]:
     fixed_candidates = []
-    for t, cand in enumerate(points_candidate):
-        if cand is None or (isinstance(cand, np.ndarray) and cand.size == 0):
+    stroke_len = stroke.shape[0]
+    
+    # 确保返回的列表长度与 stroke 的长度一致
+    for t in range(stroke_len):
+        if t < len(points_candidate):
+            cand = points_candidate[t]
+            if cand is None or (isinstance(cand, np.ndarray) and cand.size == 0):
+                p = stroke[t].astype(np.float32)
+                fixed_candidates.append(np.array([[p[0], p[1]]], dtype=np.float32))
+            else:
+                fixed_candidates.append(cand)
+        else:
+            # 如果 points_candidate 长度不足，用 stroke 点填充
             p = stroke[t].astype(np.float32)
             fixed_candidates.append(np.array([[p[0], p[1]]], dtype=np.float32))
-        else:
-            fixed_candidates.append(cand)
+    
     return fixed_candidates
 
 
@@ -279,9 +576,13 @@ def compute_weights(H: int, W: int,
                     Q_i: np.ndarray, Q_j: np.ndarray,
                     image_gray_chw: Tensor,
                     device,
-                    prev_q_i: np.ndarray = None):
+                    prev_q_i: np.ndarray = None,
+                    prev_p_i: np.ndarray = None,
+                    prev_p_j: np.ndarray = None,
+                    stroke_total_length: float = None,
+                    prev_stroke_total_length: float = None):
     """
-    计算边权重 w_e（论文 Equation 3 + 形状约束 + 拓扑顺序）。
+    计算边权重 w_e（论文 Equation 3 + 形状约束 + 拓扑顺序 + 速度约束 + 长度约束）。
     
     对于每条边 e = (q_{i,k}, q_{i+1,k'})：
     - 计算中点 m = (q_{i,k} + q_{i+1,k'}) / 2
@@ -292,10 +593,16 @@ def compute_weights(H: int, W: int,
     - 计算 deform term：||(p_{i+1} - p_i) - (q_{i+1} - q_i)||^2 / r_s^2
     - 计算 shape constraint term：形状约束项（距离和角度）
     - 计算 topology term：拓扑顺序项（避免交叉和方向一致性）
-    - 最终权重：w_e = deform_term + α * H̃(m,v) + λ_shape * shape_term + λ_topology * topology_term
+    - 计算 velocity term：速度约束项（防止过大的位移，强化版）
+    - 计算 length term：长度约束项（控制整体polyline长度的变化）
+    - 最终权重：w_e = deform_term + α * H̃(m,v) + λ_shape * shape_term + λ_topology * topology_term + λ_velocity * velocity_term + λ_length * length_term
     
     Args:
         prev_q_i: 前一个点的候选位置（用于计算形状约束和拓扑顺序），形状为(K_{i-1}, 2)
+        prev_p_i: 前一帧对应点i的位置（用于计算速度约束），形状为(2,)
+        prev_p_j: 前一帧对应点j的位置（用于计算速度约束），形状为(2,)
+        stroke_total_length: 当前帧原始stroke的总长度
+        prev_stroke_total_length: 前一帧stroke的总长度
     """
     theta_flatten_gpu = compute_affine_theta_vectorized(Q_i,
                                                         Q_j,
@@ -339,6 +646,7 @@ def compute_weights(H: int, W: int,
     # print(f"temp.shape = {res_dot_on_x.shape}, res_dot_on_x_y.shape = {res_dot_on_x_y.shape}, tilde_H.shape = {tilde_H_response.shape}")
 
     # deform term (based on paper)
+    # 形变项：惩罚候选边与原始边的差异
     r_s_square = float(EdgeSnappingConfig.r_s) ** 2
 
     p_diff = (p_j - p_i).astype(np.float32)
@@ -346,13 +654,15 @@ def compute_weights(H: int, W: int,
     diff = p_diff.reshape(1, 1, 2) - q_diff
     deform_term = np.sum(diff * diff, axis=-1) / r_s_square
 
-    # shift term (not on paper)
+    # shift term (not on paper) - 额外的位置偏移惩罚
     shift_i = np.sum((Q_i.astype(np.float32) - p_i[None, :]) ** 2, axis=-1)  # [K_i]
     shift_j = np.sum((Q_j.astype(np.float32) - p_j[None, :]) ** 2, axis=-1)  # [K_{i+1}]
     shift_term = (shift_i[:, None] + shift_j[None, :]) / (2.0 * r_s_square)  # [K_i, K_{i+1}]
 
-    # 基础权重
-    weights = deform_term + EdgeSnappingConfig.alpha * tilde_H_response
+    # 基础权重：使用 lambda_deform 增强形变控制
+    # 如果形变过大，通过增加 deform_term 的权重来惩罚
+    deform_weight = EdgeSnappingConfig.lambda_deform if EdgeSnappingConfig.lambda_deform is not None else 1.0
+    weights = deform_weight * deform_term + EdgeSnappingConfig.alpha * tilde_H_response
     
     # 形状约束项（Shape Constraint Term）
     # 约束相邻点之间的距离和角度，保持笔画的形状一致性
@@ -369,6 +679,22 @@ def compute_weights(H: int, W: int,
             p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
         )
         weights = weights + EdgeSnappingConfig.lambda_topology * topology_term
+
+    # 速度约束项（Velocity Term，强化版）
+    # 防止相邻帧之间过大的位移，保持时间连续性
+    if EdgeSnappingConfig.lambda_velocity > 0 and prev_p_i is not None and prev_p_j is not None:
+        velocity_term = compute_velocity_term(
+            prev_p_i, prev_p_j, Q_i, Q_j, r_s_square
+        )
+        weights = weights + EdgeSnappingConfig.lambda_velocity * velocity_term
+
+    # 长度约束项（Length Term）
+    # 控制整体polyline长度的变化，保持长度稳定性
+    if EdgeSnappingConfig.lambda_length > 0 and stroke_total_length is not None and stroke_total_length > 1e-6:
+        length_term = compute_length_term(
+            p_i, p_j, Q_i, Q_j, stroke_total_length, prev_stroke_total_length, r_s_square
+        )
+        weights = weights + EdgeSnappingConfig.lambda_length * length_term
 
     # print(f"p_diff.shape = {p_diff.shape}")
     # print(f"q_diff.shape = {q_diff.shape}")
@@ -441,7 +767,8 @@ def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
         angle_term = angle_diff * angle_diff
     
     # 综合形状约束项
-    shape_term = length_term + 0.5 * angle_term
+    # 增强距离约束的权重，更好地控制形变
+    shape_term = 1.5 * length_term + 0.5 * angle_term
     
     return shape_term
 
@@ -522,9 +849,129 @@ def compute_topology_term(p_i: np.ndarray, p_j: np.ndarray,
     order_term = np.where(forward_check < 0, forward_check * forward_check, 0.0)  # (K_i, K_j)
     
     # 综合拓扑顺序项
-    topology_term = direction_term + 0.3 * cross_term + 0.2 * order_term
+    # 增强拓扑约束的权重，确保拓扑逻辑得到保持
+    # 方向一致性是最重要的，交叉检测和顺序约束也很重要
+    topology_term = 1.0 * direction_term + 0.5 * cross_term + 0.4 * order_term
     
     return topology_term
+
+
+def compute_velocity_term(prev_p_i: np.ndarray, prev_p_j: np.ndarray,
+                          Q_i: np.ndarray, Q_j: np.ndarray,
+                          r_s_square: float = 400.0) -> np.ndarray:
+    """
+    计算速度约束项（Velocity Term，强化版）
+    
+    防止相邻帧之间过大的位移，保持时间连续性。
+    使用分段惩罚函数：对小位移使用线性惩罚，对大位移使用更强的平方惩罚。
+    
+    Args:
+        prev_p_i: 前一帧对应点i的位置，形状为(2,)
+        prev_p_j: 前一帧对应点j的位置，形状为(2,)
+        Q_i: 候选点组i，形状为(K_i, 2)
+        Q_j: 候选点组j，形状为(K_j, 2)
+        r_s_square: r_s的平方，用于归一化
+    
+    Returns:
+        速度约束项，形状为(K_i, K_j)
+    """
+    # 计算当前帧候选点与前一帧对应点的位移
+    # 对于点i的位移
+    displacement_i = Q_i - prev_p_i[None, :]  # (K_i, 2)
+    displacement_i_sq = np.sum(displacement_i * displacement_i, axis=-1)  # (K_i,)
+    displacement_i_norm = np.sqrt(displacement_i_sq)  # (K_i,)
+    
+    # 对于点j的位移
+    displacement_j = Q_j - prev_p_j[None, :]  # (K_j, 2)
+    displacement_j_sq = np.sum(displacement_j * displacement_j, axis=-1)  # (K_j,)
+    displacement_j_norm = np.sqrt(displacement_j_sq)  # (K_j,)
+    
+    # 强化版速度项：使用分段惩罚函数
+    # 阈值：r_s（搜索半径）作为分界点
+    r_s = np.sqrt(r_s_square)
+    threshold = r_s * 0.5  # 使用r_s的一半作为阈值
+    
+    # 对于点i：小位移线性惩罚，大位移平方惩罚
+    velocity_i = np.where(
+        displacement_i_norm <= threshold,
+        displacement_i_sq / r_s_square,  # 线性惩罚（归一化）
+        (displacement_i_norm / r_s) ** 2  # 平方惩罚（对大位移更强）
+    )
+    
+    # 对于点j：小位移线性惩罚，大位移平方惩罚
+    velocity_j = np.where(
+        displacement_j_norm <= threshold,
+        displacement_j_sq / r_s_square,  # 线性惩罚（归一化）
+        (displacement_j_norm / r_s) ** 2  # 平方惩罚（对大位移更强）
+    )
+    
+    # 综合速度项：使用平均值，并添加额外的交叉项惩罚
+    # 如果两个点都位移很大，给予额外惩罚
+    velocity_term = (velocity_i[:, None] + velocity_j[None, :]) / 2.0
+    
+    # 添加交叉项：如果两个点的位移都超过阈值，给予额外惩罚
+    both_large = (displacement_i_norm[:, None] > threshold) & (displacement_j_norm[None, :] > threshold)
+    cross_penalty = np.where(both_large, 0.5, 0.0)  # 额外惩罚
+    velocity_term = velocity_term + cross_penalty
+    
+    return velocity_term
+
+
+def compute_length_term(p_i: np.ndarray, p_j: np.ndarray,
+                        Q_i: np.ndarray, Q_j: np.ndarray,
+                        stroke_total_length: float,
+                        prev_stroke_total_length: float = None,
+                        r_s_square: float = 400.0) -> np.ndarray:
+    """
+    计算长度约束项（Length Term）
+    
+    控制整体polyline长度的变化，保持长度稳定性。
+    惩罚导致总长度变化过大的候选边。
+    
+    Args:
+        p_i: 原始笔画点i，形状为(2,)
+        p_j: 原始笔画点j，形状为(2,)
+        Q_i: 候选点组i，形状为(K_i, 2)
+        Q_j: 候选点组j，形状为(K_j, 2)
+        stroke_total_length: 当前帧原始stroke的总长度
+        prev_stroke_total_length: 前一帧stroke的总长度（可选）
+        r_s_square: r_s的平方，用于归一化
+    
+    Returns:
+        长度约束项，形状为(K_i, K_j)
+    """
+    # 计算原始边的长度
+    p_edge_length = np.linalg.norm(p_j - p_i)
+    if p_edge_length < 1e-6:
+        p_edge_length = 1e-6
+    
+    # 计算候选边的长度
+    q_edge_length = np.linalg.norm(Q_j[None, :, :] - Q_i[:, None, :], axis=-1)  # (K_i, K_j)
+    
+    # 计算该边对总长度变化的贡献
+    # 如果该边变长/变短，会导致总长度变化
+    edge_length_diff = np.abs(q_edge_length - p_edge_length) / p_edge_length  # (K_i, K_j)
+    
+    # 基础长度约束：惩罚与原始边长度差异较大的情况
+    length_term = edge_length_diff * edge_length_diff  # (K_i, K_j)
+    
+    # 如果有前一帧的长度信息，添加时间连续性约束
+    if prev_stroke_total_length is not None and prev_stroke_total_length > 1e-6:
+        # 计算如果选择该边，估计的总长度变化
+        # 假设其他边保持不变，该边的变化会导致总长度变化
+        estimated_total_length = prev_stroke_total_length - p_edge_length + q_edge_length
+        total_length_ratio = estimated_total_length / prev_stroke_total_length
+        
+        # 惩罚总长度变化过大的情况（超过20%的变化）
+        length_change_penalty = np.where(
+            (total_length_ratio < 0.8) | (total_length_ratio > 1.2),
+            (total_length_ratio - 1.0) ** 2 * 2.0,  # 对超过20%的变化给予强惩罚
+            0.0
+        )
+        
+        length_term = length_term + length_change_penalty
+    
+    return length_term
 
 
 def compute_affine_theta_vectorized(Q_i: np.ndarray,
