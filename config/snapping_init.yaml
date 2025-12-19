@@ -17,4 +17,4 @@ snapping:
   lambda_topology: 0.15  # 拓扑顺序项的权重（保持拓扑逻辑）
   lambda_deform: 1.2  # 形变项的权重（增强形变控制）
   lambda_velocity: 0.8  # 速度约束项的权重（防止过大的位移，保持时间连续性，强化版）- 增强以抑制摆动
-  lambda_length: 0.3  # 长度约束项的权重（控制整体polyline长度的变化）- 适度约束，避免过度限制
+  lambda_length: 0.5  # 长度约束项的权重（控制整体polyline长度的变化）- 增强以严格控制长度

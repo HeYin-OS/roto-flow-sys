@@ -146,6 +146,7 @@ def local_snapping(stroke: np.ndarray,
         image_rgb_hwc: 当前帧的RGB图像，形状为(H, W, 3)
         points_stroke_candidate: 候选点列表
         previous_snapped_stroke: 前一帧的吸附结果，形状为(N, 2)，用于计算速度约束
+        original_stroke_length: 原始stroke的长度（用于长度约束，如果为None则使用当前stroke的长度）
     """
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
@@ -166,10 +167,14 @@ def local_snapping(stroke: np.ndarray,
     stroke = stroke.astype(np.float32)
     
     # 计算原始stroke的总长度（用于长度约束）
-    stroke_total_length = 0.0
-    for i in range(stroke_len - 1):
-        edge_length = np.linalg.norm(stroke[i + 1] - stroke[i])
-        stroke_total_length += edge_length
+    # 如果提供了original_stroke_length，优先使用它（用于fitted传播，保持与前一帧的长度一致）
+    if original_stroke_length is not None and original_stroke_length > 1e-6:
+        stroke_total_length = original_stroke_length
+    else:
+        stroke_total_length = 0.0
+        for i in range(stroke_len - 1):
+            edge_length = np.linalg.norm(stroke[i + 1] - stroke[i])
+            stroke_total_length += edge_length
     
     # 计算前一帧的总长度（用于长度约束）
     prev_stroke_total_length = None
@@ -957,30 +962,23 @@ def compute_length_term(p_i: np.ndarray, p_j: np.ndarray,
     # 使用平方惩罚，但对小差异更宽容
     length_term = edge_length_diff * edge_length_diff  # (K_i, K_j)
     
-    # 如果有前一帧的长度信息，添加时间连续性约束
-    # 但主要参考应该是原始stroke的长度，而不是前一帧的吸附结果
-    if prev_stroke_total_length is not None and prev_stroke_total_length > 1e-6 and stroke_total_length > 1e-6:
-        # 使用原始stroke长度作为主要参考
-        # 计算如果选择该边，估计的总长度变化（相对于原始长度）
+    # 如果有原始长度信息（第一帧的原始长度），添加全局长度约束
+    # 这是最重要的约束：当前帧的结果应该几乎和最开始的输入一样长
+    if stroke_total_length is not None and stroke_total_length > 1e-6:
+        # 使用第一帧的原始stroke长度作为唯一参考
+        # 计算如果选择该边，估计的总长度变化（相对于第一帧原始长度）
         estimated_total_length = stroke_total_length - p_edge_length + q_edge_length
         total_length_ratio_to_original = estimated_total_length / stroke_total_length
         
-        # 惩罚总长度变化：相对于原始长度，使用适中的阈值（15%）
+        # 严格惩罚任何偏离原始长度的变化
+        # 使用更严格的阈值（5%），对任何变化都给予惩罚
         length_change_penalty = np.where(
-            (total_length_ratio_to_original < 0.85) | (total_length_ratio_to_original > 1.15),
-            (total_length_ratio_to_original - 1.0) ** 2 * 3.0,  # 对过大变化给予惩罚
-            0.0
+            (total_length_ratio_to_original < 0.95) | (total_length_ratio_to_original > 1.05),
+            (total_length_ratio_to_original - 1.0) ** 2 * 10.0,  # 对超过5%的变化给予强惩罚
+            (total_length_ratio_to_original - 1.0) ** 2 * 5.0   # 对5%内的变化也给予较强惩罚
         )
         
-        # 时间连续性：相对于前一帧，给予轻微约束（但不作为主要约束）
-        total_length_ratio_to_prev = estimated_total_length / prev_stroke_total_length
-        temporal_penalty = np.where(
-            (total_length_ratio_to_prev < 0.9) | (total_length_ratio_to_prev > 1.1),
-            (total_length_ratio_to_prev - 1.0) ** 2 * 1.0,  # 轻微的时间连续性约束
-            0.0
-        )
-        
-        length_term = length_term + length_change_penalty + temporal_penalty
+        length_term = length_term + length_change_penalty
     
     return length_term
 

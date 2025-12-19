@@ -108,6 +108,7 @@ class StrokeData:
     flow_nhw2: np.ndarray
     kd_tree: BatchKDTree  # 使用过滤后的候选点
     kd_tree_unfiltered: BatchKDTree = None  # 使用未过滤的候选点（用于纯光流和纯吸附）
+    original_stroke_length: float = None  # 第一帧原始stroke的长度（用于长度约束）
 
 
 @dataclass
@@ -373,6 +374,7 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
         data.images_rgb[0],
         points_stroke_candidate,
         previous_snapped_stroke=None,  # 第一帧没有前一帧
+        original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
     )
     buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
@@ -405,6 +407,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             data.images_rgb[i_frame],
             points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
             previous_snapped_stroke=previous_snapped_stroke,
+            original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.snapping[i_frame] = stroke_snapping
 
@@ -448,6 +451,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             data.images_rgb[i_frame],
             points_stroke_candidate_fitted,  # 使用过滤后的候选点
             previous_snapped_stroke=previous_fitted_stroke,
+            original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.fitted[i_frame] = stroke_fitted
 
@@ -460,6 +464,15 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
     buffers.flow[0] = None
     buffers.snapping[0] = None
     buffers.fitted[0] = None
+    
+    # 计算第一帧原始stroke的长度（用于长度约束）
+    if data.original_stroke_length is None:
+        original_length = 0.0
+        for i in range(len(stroke_initial) - 1):
+            original_length += np.linalg.norm(stroke_initial[i + 1] - stroke_initial[i])
+        # 更新data中的原始长度
+        data.original_stroke_length = original_length if original_length > 1e-6 else None
+    
     generate_prediction_stroke_on_0(buffers, data, stroke_initial)
     generate_prediction_strokes_subsequent(buffers, data)
 
