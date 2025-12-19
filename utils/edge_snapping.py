@@ -131,7 +131,8 @@ class EdgeSnappingConfig:
 def local_snapping(stroke: np.ndarray,
                    image_rgb_hwc: np.ndarray,
                    points_stroke_candidate: List[np.ndarray],
-                   previous_snapped_stroke: np.ndarray = None):
+                   previous_snapped_stroke: np.ndarray = None,
+                   original_stroke_length: float = None):
     """
     局部优化步骤：将用户笔画吸附到图像边缘特征上。
     
