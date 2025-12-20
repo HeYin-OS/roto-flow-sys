@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+import gc
 
 import cv2
 import numpy as np
@@ -382,7 +383,12 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
 def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeData) -> None:
     """Iteratively propagate strokes across frames using flow & snapping."""
 
-    for i in tqdm(range(data.images_rgb.shape[0] - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch"):
+    # 预先计算H和W，避免每次循环重复计算
+    H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
+    n_frames = data.images_rgb.shape[0]
+    
+    # 使用mininterval减少tqdm更新频率，提高性能
+    for i in tqdm(range(n_frames - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch", mininterval=0.5):
         i_frame = i + 1
 
         stroke_copied = buffers.fitted[i_frame - 1]
@@ -410,11 +416,18 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.snapping[i_frame] = stroke_snapping
+        
+        # 在每次local_snapping调用后立即清理GPU缓存，防止累积
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
+            if i_frame % 10 == 0:
+                torch.cuda.reset_peak_memory_stats()
 
         # 光流传播：从 frame i-1 到 frame i
         # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
         # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
-        H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
         
         if i == 0 or buffers.flow[i_frame - 1] is None:
             x, y = stroke_copied[:, 0], stroke_copied[:, 1]
@@ -436,6 +449,21 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
         flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
         stroke_fitted = stroke_copied + flow_vectors_fit
+        
+        # 光流传播后立即进行长度归一化，防止长度变化累积（已禁用，仅保留核心算法）
+        # 使用向量化计算，避免循环
+        # if data.original_stroke_length is not None and data.original_stroke_length > 1e-6:
+        #     # 计算光流传播后的长度（向量化）
+        #     stroke_diffs = stroke_fitted[1:] - stroke_fitted[:-1]
+        #     flow_length = np.sum(np.linalg.norm(stroke_diffs, axis=1))
+        #     
+        #     # 如果长度变化超过3%，立即归一化
+        #     if flow_length > 1e-6 and abs(flow_length - data.original_stroke_length) / data.original_stroke_length > 0.03:
+        #         scale_factor = data.original_stroke_length / flow_length
+        #         # 以第一个点为基准进行缩放（向量化）
+        #         center = stroke_fitted[0]
+        #         stroke_fitted = center + (stroke_fitted - center) * scale_factor
+        
         # 使用过滤后的候选点进行fitted传播
         points_stroke_candidate_fitted = data.kd_tree.query_batch(
             i_frame,
@@ -454,6 +482,20 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.fitted[i_frame] = stroke_fitted
+        
+        # 在每次local_snapping调用后立即清理GPU缓存，防止累积
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
+            if i_frame % 10 == 0:
+                torch.cuda.reset_peak_memory_stats()
+        
+        # 定期清理Python对象和GPU内存，防止累积
+        if i % 5 == 0:  # 每5帧清理一次（提高清理频率）
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # 同时清理GPU缓存
 
 
 def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffers, stroke_initial: np.ndarray) -> None:

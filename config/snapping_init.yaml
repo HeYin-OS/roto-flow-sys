@@ -13,8 +13,8 @@ snapping:
   candidate_num: 4
   sampling_num: 100
   average_weight_threshold: 0.07
-  lambda_shape: 0.1  # 形状约束项的权重（控制形变程度）
-  lambda_topology: 0.15  # 拓扑顺序项的权重（保持拓扑逻辑）
-  lambda_deform: 1.2  # 形变项的权重（增强形变控制）
-  lambda_velocity: 0.8  # 速度约束项的权重（防止过大的位移，保持时间连续性，强化版）- 增强以抑制摆动
-  lambda_length: 0.5  # 长度约束项的权重（控制整体polyline长度的变化）- 增强以严格控制长度
+  lambda_shape: 0.0  # 形状约束项的权重（已禁用，仅保留核心算法）
+  lambda_topology: 0.0  # 拓扑顺序项的权重（已禁用，仅保留核心算法）
+  lambda_deform: 1.0  # 形变项的权重（使用论文原始值）
+  lambda_velocity: 0.0  # 速度约束项的权重（已禁用，仅保留核心算法）
+  lambda_length: 0.0  # 长度约束项的权重（已禁用，仅保留核心算法）

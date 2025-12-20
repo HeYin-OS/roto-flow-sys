@@ -151,6 +151,16 @@ def local_snapping(stroke: np.ndarray,
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
 
+    # 关键修复：如果传入的stroke点数已经超过限制，直接降采样
+    # 防止点数累积导致性能下降
+    MAX_STROKE_POINTS = 200
+    if len(stroke) > MAX_STROKE_POINTS:
+        indices = np.linspace(0, len(stroke) - 1, MAX_STROKE_POINTS, dtype=np.int32)
+        stroke = stroke[indices]
+        if len(points_stroke_candidate) > MAX_STROKE_POINTS:
+            # 同时调整候选点列表的长度
+            points_stroke_candidate = points_stroke_candidate[:MAX_STROKE_POINTS]
+    
     # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
     H = image_rgb_hwc.shape[0]
     W = image_rgb_hwc.shape[1]
@@ -171,18 +181,16 @@ def local_snapping(stroke: np.ndarray,
     if original_stroke_length is not None and original_stroke_length > 1e-6:
         stroke_total_length = original_stroke_length
     else:
-        stroke_total_length = 0.0
-        for i in range(stroke_len - 1):
-            edge_length = np.linalg.norm(stroke[i + 1] - stroke[i])
-            stroke_total_length += edge_length
+        # 使用向量化计算，避免循环
+        stroke_diffs = stroke[1:] - stroke[:-1]
+        stroke_total_length = np.sum(np.linalg.norm(stroke_diffs, axis=1))
     
     # 计算前一帧的总长度（用于长度约束）
     prev_stroke_total_length = None
     if previous_snapped_stroke is not None and len(previous_snapped_stroke) > 1:
-        prev_stroke_total_length = 0.0
-        for i in range(len(previous_snapped_stroke) - 1):
-            edge_length = np.linalg.norm(previous_snapped_stroke[i + 1] - previous_snapped_stroke[i])
-            prev_stroke_total_length += edge_length
+        # 使用向量化计算，避免循环
+        prev_diffs = previous_snapped_stroke[1:] - previous_snapped_stroke[:-1]
+        prev_stroke_total_length = np.sum(np.linalg.norm(prev_diffs, axis=1))
 
     # ready for dp
     # energy -> accumulated energy for each candidate point
@@ -227,9 +235,17 @@ def local_snapping(stroke: np.ndarray,
                                   stroke_total_length=stroke_total_length,
                                   prev_stroke_total_length=prev_stroke_total_length)  # shape: [K_i, K_j]
 
-        # print(f"weights.shape: {weights.shape} ")
-
         dp_energy_iteration(i_group, flatten_index_ptr, energy, prev, weights)
+        
+        # 关键优化：减少同步频率，但确保在关键位置同步
+        # 每2个点对同步一次，平衡性能和队列累积
+        if torch.cuda.is_available():
+            if (i_group + 1) % 2 == 0:  # 每2个点对同步一次
+                torch.cuda.synchronize()  # 确保GPU操作完成
+                torch.cuda.empty_cache()  # 清理GPU缓存
+                # 每10个点对重置一次GPU内存统计
+                if (i_group + 1) % 10 == 0:
+                    torch.cuda.reset_peak_memory_stats()  # 重置峰值内存统计
 
     snapped_stroke = pick_best_path(last_start=flatten_index_ptr[-2],
                                     last_end=flatten_index_ptr[-1],
@@ -240,8 +256,29 @@ def local_snapping(stroke: np.ndarray,
                                     average_weight_standard=EdgeSnappingConfig.average_weight_threshold,
                                     average_distance_standard=EdgeSnappingConfig.r_s / 4.0)
     
+    # 后处理：如果长度变化超过阈值，进行归一化（已禁用，仅保留核心算法）
+    # if original_stroke_length is not None and original_stroke_length > 1e-6:
+    #     # 使用向量化计算，避免循环
+    #     snapped_diffs = snapped_stroke[1:] - snapped_stroke[:-1]
+    #     snapped_length = np.sum(np.linalg.norm(snapped_diffs, axis=1))
+    #     
+    #     # 如果长度变化超过3%，进行归一化
+    #     if snapped_length > 1e-6 and abs(snapped_length - original_stroke_length) / original_stroke_length > 0.03:
+    #         scale_factor = original_stroke_length / snapped_length
+    #         # 以第一个点为基准进行缩放（向量化）
+    #         center = snapped_stroke[0]
+    #         snapped_stroke = center + (snapped_stroke - center) * scale_factor
+    
     # 检查并修复拓扑结构
     snapped_stroke = check_and_fix_topology(snapped_stroke, stroke)
+    
+    # 显式释放GPU内存 - 更彻底的清理
+    del image_tensor_gray_chw
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()  # 确保所有GPU操作完成
+        torch.cuda.empty_cache()  # 清理GPU缓存
+        # 强制同步，确保内存真正释放
+        torch.cuda.ipc_collect()  # 清理进程间通信缓存（如果存在）
     
     return snapped_stroke
 
@@ -279,6 +316,8 @@ def detect_crossings(stroke: np.ndarray) -> bool:
     """
     检测笔画中是否有边交叉
     
+    优化：只检查相邻的边和局部范围内的边，避免O(n²)复杂度
+    
     Args:
         stroke: 笔画点数组，形状为(N, 2)
     
@@ -289,12 +328,22 @@ def detect_crossings(stroke: np.ndarray) -> bool:
     if n < 4:
         return False
     
+    # 优化：限制检查范围，只检查相邻的边和局部范围内的边
+    # 这样可以避免O(n²)复杂度，同时仍能检测到大部分交叉问题
+    CHECK_RANGE = min(10, n // 4)  # 最多检查前后10条边，或总边数的1/4
+    
     # 检查相邻的边是否交叉
     for i in range(n - 3):
         p1 = stroke[i]
         p2 = stroke[i + 1]
         
-        for j in range(i + 2, n - 1):
+        # 只检查局部范围内的边，而不是所有边
+        start_j = max(i + 2, 0)
+        end_j = min(i + CHECK_RANGE + 2, n - 1)
+        
+        for j in range(start_j, end_j):
+            if j >= n - 1:
+                break
             p3 = stroke[j]
             p4 = stroke[j + 1]
             
@@ -325,10 +374,11 @@ def segments_intersect(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.nd
     # (p3, p4, p1) 和 (p3, p4, p2) 的方向不同
     return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
 
-
 def detect_direction_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray) -> bool:
     """
     检测方向问题（点是否按正确顺序排列）
+    
+    改进：更敏感地检测局部失序问题
     
     Args:
         snapped_stroke: 吸附后的笔画
@@ -361,12 +411,13 @@ def detect_direction_issues(snapped_stroke: np.ndarray, original_stroke: np.ndar
     # 检查方向是否一致（点积应该接近1）
     direction_consistency = np.dot(original_dir_normalized, snapped_dir_normalized)
     
-    # 如果方向一致性小于0.5，认为有方向问题
-    if direction_consistency < 0.5:
+    # 如果方向一致性小于0.7（更严格的阈值），认为有方向问题
+    if direction_consistency < 0.7:
         return True
     
-    # 检查局部方向是否频繁反转
+    # 检查局部方向是否频繁反转（改进：更敏感）
     reversal_count = 0
+    severe_reversal_count = 0
     for i in range(len(snapped_stroke) - 2):
         edge1 = snapped_stroke[i + 1] - snapped_stroke[i]
         edge2 = snapped_stroke[i + 2] - snapped_stroke[i + 1]
@@ -377,12 +428,39 @@ def detect_direction_issues(snapped_stroke: np.ndarray, original_stroke: np.ndar
             dot_product = np.dot(edge1_norm, edge2_norm)
             
             # 如果相邻边的方向相反（点积为负），计数
-            if dot_product < -0.3:
+            if dot_product < -0.2:  # 降低阈值，更敏感
                 reversal_count += 1
+            if dot_product < -0.5:  # 严重反转
+                severe_reversal_count += 1
     
-    # 如果反转次数超过总边数的20%，认为有方向问题
-    if reversal_count > (len(snapped_stroke) - 2) * 0.2:
+    # 如果严重反转次数超过总边数的10%，认为有方向问题
+    if severe_reversal_count > (len(snapped_stroke) - 2) * 0.1:
         return True
+    
+    # 如果反转次数超过总边数的15%（降低阈值），认为有方向问题
+    if reversal_count > (len(snapped_stroke) - 2) * 0.15:
+        return True
+    
+    # 检查局部顺序：检测是否有"回退"的点
+    # 如果某个点相对于前一个点在错误的方向上，说明顺序有问题
+    if len(snapped_stroke) >= 3:
+        backward_count = 0
+        for i in range(1, len(snapped_stroke) - 1):
+            # 计算从i-1到i+1的方向
+            forward_dir = snapped_stroke[i + 1] - snapped_stroke[i - 1]
+            forward_dir_norm = forward_dir / (np.linalg.norm(forward_dir) + 1e-6)
+            
+            # 计算从i-1到i的方向
+            to_i_dir = snapped_stroke[i] - snapped_stroke[i - 1]
+            to_i_dir_norm = to_i_dir / (np.linalg.norm(to_i_dir) + 1e-6)
+            
+            # 如果点i在错误的方向上（点积为负），说明顺序有问题
+            if np.dot(forward_dir_norm, to_i_dir_norm) < 0.3:
+                backward_count += 1
+        
+        # 如果回退点超过10%，认为有方向问题
+        if backward_count > (len(snapped_stroke) - 2) * 0.1:
+            return True
     
     return False
 
@@ -413,6 +491,9 @@ def fix_topology_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray,
         if np.dot(original_dir, snapped_dir) < 0:
             # 方向相反，反转整个笔画
             fixed_stroke = fixed_stroke[::-1]
+        else:
+            # 整体方向正确，但可能有局部失序，进行局部修复
+            fixed_stroke = fix_local_disorder(fixed_stroke, original_stroke)
     
     # 如果有交叉，尝试平滑处理
     if has_crossing:
@@ -430,6 +511,47 @@ def fix_topology_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray,
     return fixed_stroke
 
 
+def fix_local_disorder(stroke: np.ndarray, original_stroke: np.ndarray) -> np.ndarray:
+    """
+    修复局部失序问题
+    
+    检测并修复局部点的顺序问题，例如某个点相对于前一个点在错误的方向上
+    
+    Args:
+        stroke: 需要修复的笔画
+        original_stroke: 原始笔画（用于参考）
+    
+    Returns:
+        修复后的笔画
+    """
+    if len(stroke) < 3:
+        return stroke
+    
+    fixed_stroke = stroke.copy()
+    
+    # 计算原始笔画的方向
+    original_dir = original_stroke[-1] - original_stroke[0]
+    original_dir_norm = original_dir / (np.linalg.norm(original_dir) + 1e-6)
+    
+    # 检测并修复局部失序
+    for i in range(1, len(fixed_stroke) - 1):
+        # 计算从i-1到i+1的方向（期望方向）
+        expected_dir = fixed_stroke[i + 1] - fixed_stroke[i - 1]
+        expected_dir_norm = expected_dir / (np.linalg.norm(expected_dir) + 1e-6)
+        
+        # 计算从i-1到i的方向（实际方向）
+        actual_dir = fixed_stroke[i] - fixed_stroke[i - 1]
+        actual_dir_norm = actual_dir / (np.linalg.norm(actual_dir) + 1e-6)
+        
+        # 如果实际方向与期望方向差异很大（点积小于0.5），说明点i可能位置不对
+        if np.dot(expected_dir_norm, actual_dir_norm) < 0.5:
+            # 尝试将点i移动到更合理的位置
+            # 使用线性插值：点i应该在i-1和i+1之间的中间位置
+            fixed_stroke[i] = 0.5 * fixed_stroke[i - 1] + 0.5 * fixed_stroke[i + 1]
+    
+    return fixed_stroke
+
+
 def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) -> np.ndarray:
     """
     确保点之间的距离合理（不会太短或太长）
@@ -443,6 +565,21 @@ def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) ->
     """
     if len(stroke) < 2:
         return stroke
+    
+    # 关键修复：使用固定的最大点数限制，防止点数无限增长
+    # 如果original_stroke已经很大，使用固定限制；否则使用2倍限制
+    original_len = len(original_stroke)
+    if original_len > 100:
+        # 如果原始stroke已经很大，使用固定限制（200点）
+        MAX_STROKE_POINTS = 200
+    else:
+        # 如果原始stroke较小，使用2倍限制
+        MAX_STROKE_POINTS = min(original_len * 2, 200)  # 最多200点
+    
+    # 如果当前stroke已经超过限制，直接降采样返回
+    if len(stroke) > MAX_STROKE_POINTS:
+        indices = np.linspace(0, len(stroke) - 1, MAX_STROKE_POINTS, dtype=np.int32)
+        return stroke[indices]
     
     # 计算原始笔画的平均边长度
     original_lengths = []
@@ -463,6 +600,18 @@ def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) ->
     # 检查并调整过短或过长的边
     i = 0
     while i < len(fixed_stroke) - 1:
+        # 如果点数已经超过限制，停止插入新点，只进行合并操作
+        if len(fixed_stroke) >= MAX_STROKE_POINTS:
+            # 只进行合并操作，不再插入新点
+            edge = fixed_stroke[i + 1] - fixed_stroke[i]
+            length = np.linalg.norm(edge)
+            if length < min_length and length > 1e-6:
+                if i + 1 < len(fixed_stroke) - 1:
+                    fixed_stroke = np.delete(fixed_stroke, i + 1, axis=0)
+                    continue
+            i += 1
+            continue
+        
         edge = fixed_stroke[i + 1] - fixed_stroke[i]
         length = np.linalg.norm(edge)
         
@@ -473,19 +622,29 @@ def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) ->
                 fixed_stroke = np.delete(fixed_stroke, i + 1, axis=0)
                 continue
         elif length > max_length:
-            # 边太长，在中间插入点
+            # 边太长，在中间插入点（但不超过最大点数限制）
             num_insert = int(length / avg_length)
             if num_insert > 1:
-                new_points = []
-                for j in range(1, num_insert):
-                    t = j / num_insert
-                    new_point = fixed_stroke[i] * (1 - t) + fixed_stroke[i + 1] * t
-                    new_points.append(new_point)
-                if new_points:
-                    fixed_stroke = np.insert(fixed_stroke, i + 1, new_points, axis=0)
-                    i += len(new_points)
+                # 限制插入的点数，确保不超过最大点数
+                max_insert = MAX_STROKE_POINTS - len(fixed_stroke)
+                num_insert = min(num_insert, max_insert)
+                if num_insert > 0:
+                    new_points = []
+                    for j in range(1, num_insert + 1):
+                        t = j / (num_insert + 1)
+                        new_point = fixed_stroke[i] * (1 - t) + fixed_stroke[i + 1] * t
+                        new_points.append(new_point)
+                    if new_points:
+                        fixed_stroke = np.insert(fixed_stroke, i + 1, new_points, axis=0)
+                        i += len(new_points)
         
         i += 1
+    
+    # 如果点数仍然超过限制，进行降采样
+    if len(fixed_stroke) > MAX_STROKE_POINTS:
+        # 均匀采样，保持原始点数
+        indices = np.linspace(0, len(fixed_stroke) - 1, MAX_STROKE_POINTS, dtype=np.int32)
+        fixed_stroke = fixed_stroke[indices]
     
     return fixed_stroke
 
@@ -521,8 +680,23 @@ def pick_best_path(last_start,
                    average_distance_standard):
     # TODO: add checks of two conditions based on the paper
     stroke_len = stroke.shape[0]
+    
+    # 性能优化：限制最大迭代次数，防止无限循环
+    max_iterations = 10  # 最多迭代10次
+    iteration_count = 0
 
     while True:
+        iteration_count += 1
+        if iteration_count > max_iterations:
+            # 如果迭代次数过多，直接返回当前最佳路径
+            best_idx = np.argmin(energy[last_start:last_end]) + last_start
+            best_path_indices = []
+            temp_idx = best_idx
+            while temp_idx != -1:
+                best_path_indices.append(temp_idx)
+                temp_idx = prev[temp_idx]
+            best_path_indices.reverse()
+            return candidates_flatten[best_path_indices]
         # last point index of underlying candidate stroke
         best_idx = np.argmin(energy[last_start:last_end]) + last_start
         curr_idx = best_idx
@@ -530,10 +704,13 @@ def pick_best_path(last_start,
         avg_en = energy[best_idx] / (stroke_len - 1)
 
         # use backtrack to find all points of candidate stroke
+        # 使用append然后reverse，避免insert(0, ...)的O(n)复杂度
         best_path_indices = []
-        while best_idx != -1:
-            best_path_indices.insert(0, best_idx)
-            best_idx = prev[best_idx]
+        temp_idx = best_idx
+        while temp_idx != -1:
+            best_path_indices.append(temp_idx)
+            temp_idx = prev[temp_idx]
+        best_path_indices.reverse()  # O(n)操作，但只执行一次
 
         # use slice to get the candidate stroke
         candidate_stroke_xy = candidates_flatten[best_path_indices]
@@ -610,28 +787,79 @@ def compute_weights(H: int, W: int,
         stroke_total_length: 当前帧原始stroke的总长度
         prev_stroke_total_length: 前一帧stroke的总长度
     """
-    theta_flatten_gpu = compute_affine_theta_vectorized(Q_i,
-                                                        Q_j,
-                                                        H, W).to(device)  # shape: [K_{i} * K_{i+1}, 2, 3]
+    # 使用torch.no_grad()避免梯度计算开销
+    with torch.no_grad():
+        # 注意：compute_affine_theta_vectorized已经返回GPU tensor，不需要再次.to(device)
+        theta_flatten_gpu = compute_affine_theta_vectorized(Q_i,
+                                                            Q_j,
+                                                            H, W)  # shape: [K_{i} * K_{i+1}, 2, 3]
+        # 确保tensor是contiguous的，避免后续操作的开销
+        if not theta_flatten_gpu.is_contiguous():
+            theta_flatten_gpu = theta_flatten_gpu.contiguous()
+        # affine_grid操作本身就在GPU上，不需要.to(device)
+        grid_gpu = torch.nn.functional.affine_grid(theta_flatten_gpu,
+                                                   size=[theta_flatten_gpu.shape[0],
+                                                         1,
+                                                         2 * EdgeSnappingConfig.Y_MAX + 1,
+                                                         2 * EdgeSnappingConfig.X_MAX + 1],
+                                                   align_corners=False)  # shape: [K_{i} * K_{i+1}, 2*Y+1, 2*X+1, 2]
+        # 确保grid是contiguous的
+        if not grid_gpu.is_contiguous():
+            grid_gpu = grid_gpu.contiguous()
 
-    grid_gpu = torch.nn.functional.affine_grid(theta_flatten_gpu,
-                                               size=[theta_flatten_gpu.shape[0],
-                                                     1,
-                                                     2 * EdgeSnappingConfig.Y_MAX + 1,
-                                                     2 * EdgeSnappingConfig.X_MAX + 1],
-                                               align_corners=False).to(device)  # shape: [K_{i} * K_{i+1}, 2*Y+1, 2*X+1, 2]
-
-    image_affined = (torch.nn.functional.grid_sample(image_gray_chw.expand(grid_gpu.shape[0], -1, -1, -1),
-                                                     grid_gpu,
-                                                     mode='bilinear',
-                                                     padding_mode='zeros',
-                                                     align_corners=False)
-                     .squeeze(1)
-                     .reshape(Q_i.shape[0],
-                              Q_j.shape[0],
-                              2 * EdgeSnappingConfig.Y_MAX + 1,
-                              2 * EdgeSnappingConfig.X_MAX + 1)
-                     .cpu().numpy())  # change to nparray such that do tensor dot afterward
+        # 使用expand而不是repeat，expand是view操作，不复制数据，更高效
+        # 但需要确保tensor是contiguous的
+        batch_size = grid_gpu.shape[0]
+        
+        # 性能优化：如果batch_size太大（超过1000），可能影响性能
+        # 这通常发生在候选点数量很多的情况下
+        if batch_size > 1000:
+            # 可以考虑进一步限制候选点数量，但这里先继续处理
+            pass
+        
+        # 确保image_gray_chw是contiguous的
+        if not image_gray_chw.is_contiguous():
+            image_gray_chw = image_gray_chw.contiguous()
+        
+        # 关键优化：使用repeat而不是expand，因为expand在某些情况下可能不会真正共享内存
+        # 虽然repeat会复制数据，但可以避免GPU内存碎片化问题
+        # 对于batch_size很大的情况，可以考虑分批处理
+        if batch_size > 500:
+            # 如果batch_size太大，分批处理以避免GPU内存问题
+            # 但这需要修改grid_sample的调用方式，暂时先继续使用expand
+            image_expanded = image_gray_chw.expand(batch_size, -1, -1, -1)
+        else:
+            image_expanded = image_gray_chw.expand(batch_size, -1, -1, -1)
+        
+        # 执行grid_sample（这是最耗时的GPU操作）
+        image_affined_gpu = torch.nn.functional.grid_sample(image_expanded,
+                                                           grid_gpu,
+                                                           mode='bilinear',
+                                                           padding_mode='zeros',
+                                                           align_corners=False)
+        
+        # 优化：减少同步频率，只在必要时同步
+        # 立即释放GPU tensor，避免累积
+        del theta_flatten_gpu, grid_gpu, image_expanded
+        
+        # 优化：.cpu()操作会隐式同步GPU，但为了确保操作完成，在CPU传输前同步一次
+        # 注意：频繁同步会导致性能下降，所以只在必要时同步
+        if torch.cuda.is_available():
+            # 只在batch_size较大时同步，避免小操作的开销
+            if batch_size > 200:
+                torch.cuda.synchronize()  # 确保GPU操作完成
+        
+        # 将结果移到CPU并转换为numpy（这会触发GPU到CPU的传输，隐式同步）
+        image_affined = (image_affined_gpu
+                         .squeeze(1)
+                         .reshape(Q_i.shape[0],
+                                  Q_j.shape[0],
+                                  2 * EdgeSnappingConfig.Y_MAX + 1,
+                                  2 * EdgeSnappingConfig.X_MAX + 1)
+                         .cpu().numpy())
+        
+        # 删除GPU tensor
+        del image_affined_gpu
 
     # FDoG 滤波器实现（论文 Equation 1）：
     # H(m,v) = ∫_{-Y}^{Y} G_σm(y) ∫_{-X}^{X} I(l(x,y)) f(x) dx dy
@@ -720,7 +948,9 @@ def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
     """
     计算形状约束项（Shape Constraint Term）
     
-    约束相邻点之间的距离和角度，保持笔画的形状一致性
+    约束相邻点之间的角度，保持笔画的形状一致性
+    
+    注意：长度约束已移至 compute_length_term，避免重复计算
     
     Args:
         p_i: 原始笔画点i，形状为(2,)
@@ -728,25 +958,14 @@ def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
         Q_i: 候选点组i，形状为(K_i, 2)
         Q_j: 候选点组j，形状为(K_j, 2)
         prev_q_i: 前一个点的候选位置（可选），形状为(K_{i-1}, 2)
-        r_s_square: r_s的平方，用于归一化
+        r_s_square: r_s的平方，用于归一化（当前未使用，保留以兼容接口）
     
     Returns:
-        形状约束项，形状为(K_i, K_j)
+        形状约束项（角度约束），形状为(K_i, K_j)
     """
-    # 计算原始边的长度
-    p_diff = p_j - p_i  # (2,)
-    p_length = np.linalg.norm(p_diff)
-    if p_length < 1e-6:
-        p_length = 1e-6
-    
-    # 计算候选边的长度
+    # 计算候选边的方向（用于角度约束）
     q_diff = Q_j[None, :, :] - Q_i[:, None, :]  # (K_i, K_j, 2)
-    q_length = np.linalg.norm(q_diff, axis=-1)  # (K_i, K_j)
-    
-    # 距离约束：保持相邻点之间的距离接近原始距离
-    # 惩罚与原始距离差异较大的情况
-    length_diff = np.abs(q_length - p_length) / p_length
-    length_term = length_diff * length_diff  # (K_i, K_j)
+    q_length = np.linalg.norm(q_diff, axis=-1, keepdims=True)  # (K_i, K_j, 1)
     
     # 角度约束：如果有前一个点，约束角度变化
     angle_term = np.zeros((Q_i.shape[0], Q_j.shape[0]), dtype=np.float32)
@@ -762,7 +981,7 @@ def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
         prev_edge_normalized = prev_edge / (prev_edge_length + 1e-6)  # (K_i, 2)
         
         # 当前边的方向
-        curr_edge_normalized = q_diff / (q_length[:, :, None] + 1e-6)  # (K_i, K_j, 2)
+        curr_edge_normalized = q_diff / (q_length + 1e-6)  # (K_i, K_j, 2)
         
         # 计算角度变化（使用点积）
         cos_angle = np.sum(prev_edge_normalized[:, None, :] * curr_edge_normalized, axis=-1)  # (K_i, K_j)
@@ -772,9 +991,8 @@ def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,
         angle_diff = 1.0 - cos_angle  # 0表示角度相同，2表示完全相反
         angle_term = angle_diff * angle_diff
     
-    # 综合形状约束项
-    # 增强距离约束的权重，更好地控制形变
-    shape_term = 1.5 * length_term + 0.5 * angle_term
+    # 形状约束项：只包含角度约束（长度约束已移至 compute_length_term）
+    shape_term = angle_term
     
     return shape_term
 
@@ -967,18 +1185,22 @@ def compute_length_term(p_i: np.ndarray, p_j: np.ndarray,
     if stroke_total_length is not None and stroke_total_length > 1e-6:
         # 使用第一帧的原始stroke长度作为唯一参考
         # 计算如果选择该边，估计的总长度变化（相对于第一帧原始长度）
+        # 注意：这里假设其他边保持不变，虽然不完美，但可以给出局部估计
         estimated_total_length = stroke_total_length - p_edge_length + q_edge_length
         total_length_ratio_to_original = estimated_total_length / stroke_total_length
         
         # 严格惩罚任何偏离原始长度的变化
-        # 使用更严格的阈值（5%），对任何变化都给予惩罚
+        # 使用更严格的阈值（3%），对任何变化都给予强惩罚
+        # 使用指数惩罚函数，使长度约束更敏感
+        length_deviation = np.abs(total_length_ratio_to_original - 1.0)
         length_change_penalty = np.where(
-            (total_length_ratio_to_original < 0.95) | (total_length_ratio_to_original > 1.05),
-            (total_length_ratio_to_original - 1.0) ** 2 * 10.0,  # 对超过5%的变化给予强惩罚
-            (total_length_ratio_to_original - 1.0) ** 2 * 5.0   # 对5%内的变化也给予较强惩罚
+            length_deviation > 0.03,
+            (total_length_ratio_to_original - 1.0) ** 2 * 20.0,  # 对超过3%的变化给予极强惩罚
+            (total_length_ratio_to_original - 1.0) ** 2 * 10.0   # 对3%内的变化也给予强惩罚
         )
         
-        length_term = length_term + length_change_penalty
+        # 添加额外的长度偏差惩罚（即使很小也惩罚）
+        length_term = length_term + length_change_penalty + length_deviation * 2.0
     
     return length_term
 
@@ -989,8 +1211,16 @@ def compute_affine_theta_vectorized(Q_i: np.ndarray,
                                     eps: np.float32 = 1e-6) -> Tensor:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    Q_i = torch.from_numpy(Q_i.copy().astype(np.float32)).to(device)
-    Q_j = torch.from_numpy(Q_j.copy().astype(np.float32)).to(device)
+    # 优化：确保输入是float32，避免类型转换开销
+    if Q_i.dtype != np.float32:
+        Q_i = Q_i.astype(np.float32)
+    if Q_j.dtype != np.float32:
+        Q_j = Q_j.astype(np.float32)
+    
+    # 避免不必要的copy，直接转换到GPU
+    # 使用pin_memory=False避免额外的CPU-GPU传输开销
+    Q_i = torch.from_numpy(Q_i).to(device, non_blocking=False)  # 改为False，确保立即传输
+    Q_j = torch.from_numpy(Q_j).to(device, non_blocking=False)  # 改为False，确保立即传输
 
     # print(f"new Qi: {Qi.shape}")
     # print(f"new Qj: {Qj.shape}")
