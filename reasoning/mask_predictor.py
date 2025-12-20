@@ -18,13 +18,15 @@ import torch
 from PIL import Image
 from scipy.ndimage import binary_fill_holes, distance_transform_edt
 from transformers import AutoProcessor, AutoModelForCausalLM
-from sam2.build_sam import build_sam2
+from sam2.build_sam import build_sam2, build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+import tempfile
+import shutil
 
 from utils.path_utils import build_project_paths, get_target_name
 
@@ -148,11 +150,18 @@ class MaskExtractor:
         else:
             print(f"✅ 版本匹配: 配置文件({config_version})与检查点({checkpoint_version})版本一致")
         
-        # 加载SAM2模型
+        # 保存配置路径，用于后续创建video_predictor
+        self.sam2_config_path = sam2_config_path
+        self.sam2_checkpoint_path = sam2_checkpoint_path
+        
+        # 加载SAM2模型（用于单帧预测）
         # build_sam2函数会根据配置文件自动加载对应的模型架构
         # SAM2.1和SAM2使用相同的build_sam2函数，区别在于配置文件和检查点
         self.sam2_model = build_sam2(sam2_config_path, sam2_checkpoint_path, device=self.device)
         self.predictor = SAM2ImagePredictor(self.sam2_model)
+        
+        # 视频预测器（延迟加载，只在需要时创建）
+        self.video_predictor = None
         
         # 显示实际加载的模型信息
         model_name = self.sam2_model.__class__.__name__
@@ -162,6 +171,19 @@ class MaskExtractor:
         
         # 保存设备信息供后续使用
         self.device = self.sam2_model.device if hasattr(self.sam2_model, 'device') else device
+    
+    def _get_video_predictor(self):
+        """延迟加载视频预测器"""
+        if self.video_predictor is None:
+            print("🎬 初始化SAM2视频预测器...")
+            self.video_predictor = build_sam2_video_predictor(
+                self.sam2_config_path,
+                self.sam2_checkpoint_path,
+                device=self.device,
+                apply_postprocessing=True
+            )
+            print("✅ SAM2视频预测器初始化完成")
+        return self.video_predictor
     
     def extract_mask_from_box(
         self, 
@@ -182,30 +204,17 @@ class MaskExtractor:
             reset_predictor: 是否重置predictor（确保每帧独立），默认True
             use_multimask: 是否使用多mask输出，选择最好的，默认True
             use_point_prompt: 是否使用点提示（边界框中心点），默认True
-            high_precision_mode: 高精度模式，使用更多计算提升精度，默认False
-            ensemble_passes: 集成推理次数，多次推理并融合结果，默认1
+            high_precision_mode: 高精度模式，影响集成推理次数，默认True
+            ensemble_passes: 集成推理次数，多次推理并融合结果，默认2
         
         Returns:
             (mask, score) 元组，mask为二值mask，score为置信度分数
         """
-        # 高精度模式：使用更高分辨率的图像
-        original_image = image
-        scale_factor = 1.0
-        
         # 确保box是numpy数组（修复类型问题）
         if not isinstance(box, np.ndarray):
             box = np.array(box, dtype=np.float32)
         else:
             box = box.astype(np.float32)
-        
-        if high_precision_mode:
-            # 将图像放大1.5倍（提升细节）
-            h, w = image.shape[:2]
-            new_h, new_w = int(h * 1.5), int(w * 1.5)
-            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            # 相应调整边界框（numpy数组可以直接乘以标量）
-            box = box * 1.5
-            scale_factor = 1.5
         
         # 每帧独立：重置predictor状态，确保不依赖前帧
         if reset_predictor:
@@ -216,54 +225,15 @@ class MaskExtractor:
         
         input_box = np.array([box])
         
-        # 改进：同时使用边界框和多个点提示（点提示通常更准确）
-        # 高精度模式：使用更多的点提示
+        # 使用边界框 + 单个中心点提示（避免角点落在背景中产生误导）
         point_coords = None
         point_labels = None
         if use_point_prompt:
+            # 只使用边界框的中心点，避免角点落在背景中
             center_x = (box[0] + box[2]) / 2.0
             center_y = (box[1] + box[3]) / 2.0
-            x1, y1, x2, y2 = box
-            w, h = x2 - x1, y2 - y1
-            
-            if high_precision_mode:
-                # 高精度模式：使用9个点（中心 + 8个方向）
-                margin = 0.15
-                x1_inner = x1 + w * margin
-                y1_inner = y1 + h * margin
-                x2_inner = x2 - w * margin
-                y2_inner = y2 - h * margin
-                x_mid = (x1 + x2) / 2.0
-                y_mid = (y1 + y2) / 2.0
-                
-                point_coords = np.array([
-                    [center_x, center_y],      # 中心
-                    [x1_inner, y1_inner],      # 左上
-                    [x_mid, y1_inner],         # 上中
-                    [x2_inner, y1_inner],      # 右上
-                    [x1_inner, y_mid],         # 左中
-                    [x2_inner, y_mid],         # 右中
-                    [x1_inner, y2_inner],      # 左下
-                    [x_mid, y2_inner],         # 下中
-                    [x2_inner, y2_inner],      # 右下
-                ], dtype=np.float32)
-                point_labels = np.array([1] * 9, dtype=np.int32)
-            else:
-                # 标准模式：5个点
-                margin = 0.1
-                x1_inner = x1 + w * margin
-                y1_inner = y1 + h * margin
-                x2_inner = x2 - w * margin
-                y2_inner = y2 - h * margin
-                
-                point_coords = np.array([
-                    [center_x, center_y],  # 中心点
-                    [x1_inner, y1_inner],  # 左上
-                    [x2_inner, y1_inner],  # 右上
-                    [x1_inner, y2_inner],  # 左下
-                    [x2_inner, y2_inner],  # 右下
-                ], dtype=np.float32)
-                point_labels = np.array([1, 1, 1, 1, 1], dtype=np.int32)
+            point_coords = np.array([[center_x, center_y]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int32)
         
         # 集成推理：多次推理并融合结果（高精度模式）
         all_masks = []
@@ -333,22 +303,13 @@ class MaskExtractor:
             # 方法：取所有mask的平均值（软融合），然后二值化
             combined_mask = np.mean(all_masks, axis=0)
             combined_score = np.mean(all_scores)
-            # 对融合后的mask进行二值化（阈值0.5）
-            final_mask = (combined_mask > 0.5).astype(np.float32)
+            # 对融合后的mask进行二值化（降低阈值到-1.0以包含更多"可能是物体"的像素）
+            # SAM2输出的是logits，0.0代表50%概率，-1.0代表约27%概率，提高召回率
+            final_mask = (combined_mask > -1.0).astype(np.float32)
         else:
-            final_mask = all_masks[0]
+            # 单次推理也需要应用阈值（SAM2输出的是logits）
+            final_mask = (all_masks[0] > -1.0).astype(np.float32)
             combined_score = all_scores[0]
-        
-        # 如果使用了高精度模式，需要将mask缩放回原始尺寸
-        if high_precision_mode and scale_factor > 1.0:
-            original_h, original_w = original_image.shape[:2]
-            final_mask = cv2.resize(
-                final_mask.astype(np.float32),
-                (original_w, original_h),
-                interpolation=cv2.INTER_LINEAR
-            )
-            # 重新二值化（因为resize可能产生中间值）
-            final_mask = (final_mask > 0.5).astype(np.float32)
         
         return final_mask, combined_score
     
@@ -445,12 +406,8 @@ class MaskExtractor:
                                     ensemble_passes=ensemble_passes  # 默认2
                                 )
                                 
-                                # 计算阈值
-                                mask_mean = mask_raw.mean()
-                                if mask_mean < 0.6:
-                                    threshold = max(0.35, mask_mean - 0.15)
-                                else:
-                                    threshold = 0.5
+                                # 使用统一的低阈值（-1.0）以提高召回率，避免孔洞
+                                threshold = -1.0
                                 
                                 # 使用缓存中的mask作为二值化结果
                                 mask_binary = masks[i] if i < len(masks) else (mask_raw > threshold).astype(np.uint8)
@@ -471,20 +428,30 @@ class MaskExtractor:
         # 确保boxes是numpy数组列表
         boxes = [np.array(b, dtype=np.float32) if not isinstance(b, np.ndarray) else b.astype(np.float32) for b in boxes]
         
-        # 每帧独立处理：不使用共享的reference_box
-        # 如果只有一个框，作为初始参考；否则每帧使用对应的框
-        use_single_box = len(boxes) == 1
-        initial_box = boxes[0].copy() if use_single_box else None
+        # 使用第一帧的边界框作为初始prompt
+        initial_box = boxes[0].copy()
         
-        # 每帧独立提取边界框设置
-        independent_box_extraction = (
-            box_extractor is not None and 
-            text_prompt is not None
-        )
-        if independent_box_extraction:
-            print(f"🔄 启用每帧独立边界框提取: 每帧从当前帧提取边界框")
+        # 读取第一帧图像以获取尺寸
+        first_image = cv2.imread(str(frame_paths[0]))
+        if first_image is None:
+            raise ValueError(f"无法读取第一帧图像: {frame_paths[0]}")
+        first_image_rgb = cv2.cvtColor(first_image, cv2.COLOR_BGR2RGB)
+        img_h, img_w = first_image_rgb.shape[:2]
         
-        masks = []
+        # 扩大边界框（与之前的逻辑一致）
+        box_width = initial_box[2] - initial_box[0]
+        box_height = initial_box[3] - initial_box[1]
+        padding_x = max(box_width * 0.25, 30)
+        padding_y = max(box_height * 0.25, 30)
+        initial_box[0] = max(0, initial_box[0] - padding_x)
+        initial_box[1] = max(0, initial_box[1] - padding_y)
+        initial_box[2] = min(img_w, initial_box[2] + padding_x)
+        initial_box[3] = min(img_h, initial_box[3] + padding_y)
+        
+        print(f"🎬 使用SAM2视频预测器（方案一：治本之策）")
+        print(f"   初始边界框: {initial_box}")
+        print(f"   图像尺寸: {img_w}x{img_h}")
+        
         n_frames = len(frame_paths)
         
         # Debug模式：如果指定了debug_frames，保存这些帧的可视化
@@ -497,272 +464,154 @@ class MaskExtractor:
             debug_dir.mkdir(parents=True, exist_ok=True)
             print(f"🐛 Debug模式: 将保存帧 {debug_frames} 的调试可视化到 {debug_dir}")
         
-        print(f"开始提取 {n_frames} 帧的mask（每帧独立处理）...")
-        
-        for i, frame_path in enumerate(tqdm(frame_paths, desc="提取mask", unit="帧")):
-            # 读取图像
-            image = cv2.imread(str(frame_path))
-            if image is None:
-                raise ValueError(f"无法读取图像: {frame_path}")
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            img_h, img_w = image_rgb.shape[:2]
+        # 创建临时目录用于视频初始化
+        temp_dir = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="sam2_video_")
+            print(f"📁 创建临时目录: {temp_dir}")
             
-            # 每帧独立：从当前帧提取边界框
-            if independent_box_extraction:
+            # 将所有图像文件复制或链接到临时目录（格式：00000.jpg, 00001.jpg, ...）
+            for i, frame_path in enumerate(tqdm(frame_paths, desc="准备视频帧", unit="帧")):
+                # 读取图像并转换为JPEG格式
+                img = Image.open(frame_path).convert("RGB")
+                temp_frame_path = Path(temp_dir) / f"{i:05d}.jpg"
+                img.save(temp_frame_path, "JPEG", quality=95)
+            
+            # 初始化视频预测器
+            video_predictor = self._get_video_predictor()
+            
+            # 初始化视频状态
+            print(f"🎬 初始化视频状态（{n_frames}帧）...")
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                inference_state = video_predictor.init_state(
+                    video_path=temp_dir,
+                    offload_video_to_cpu=False,
+                    offload_state_to_cpu=False,
+                    async_loading_frames=False
+                )
+            
+            # 在第一帧（frame_idx=0）添加边界框prompt
+            print(f"📦 在第一帧添加边界框prompt...")
+            obj_id = 0  # 对象ID
+            frame_idx = 0  # 第一帧
+            
+            # 边界框格式：[x1, y1, x2, y2] -> [[x1, y1], [x2, y2]]
+            box_tensor = torch.tensor(
+                [[initial_box[0], initial_box[1]], [initial_box[2], initial_box[3]]],
+                dtype=torch.float32,
+                device=self.device
+            )
+            
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                video_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    box=box_tensor,
+                    clear_old_points=True,
+                    normalize_coords=True
+                )
+            
+            # 传播到整个视频
+            print(f"🚀 开始传播mask到整个视频...")
+            masks = []
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for frame_idx, obj_ids, pred_masks in tqdm(
+                    video_predictor.propagate_in_video(inference_state),
+                    desc="传播mask",
+                    total=n_frames,
+                    unit="帧"
+                ):
+                    # pred_masks 形状: [num_objects, 1, H, W]
+                    # 我们只关心第一个对象（obj_id=0）
+                    if len(pred_masks) > 0:
+                        mask = pred_masks[0][0].cpu().numpy()  # [H, W]
+                        masks.append(mask)
+                    else:
+                        # 如果没有预测到mask，创建一个全零mask
+                        video_h = inference_state["video_height"]
+                        video_w = inference_state["video_width"]
+                        masks.append(np.zeros((video_h, video_w), dtype=np.float32))
+            
+            # 确保masks数量与帧数一致
+            if len(masks) < n_frames:
+                # 如果某些帧没有mask，用最后一帧的mask填充
+                last_mask = masks[-1] if len(masks) > 0 else np.zeros((img_h, img_w), dtype=np.float32)
+                while len(masks) < n_frames:
+                    masks.append(last_mask.copy())
+            elif len(masks) > n_frames:
+                masks = masks[:n_frames]
+            
+            # 后处理：应用形态学操作和孔洞填充
+            print(f"🔧 应用后处理...")
+            processed_masks = []
+            for i, mask in enumerate(tqdm(masks, desc="后处理mask", unit="帧")):
+                # 二值化：降低阈值到-1.0以包含更多"可能是物体"的像素（提高召回率）
+                # SAM2输出的是logits，0.0代表50%概率，-1.0代表约27%概率
+                mask_binary = (mask > -1.0).astype(np.uint8)
+                
+                # 形态学操作：先开运算去噪（去除小的背景噪点）
+                kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_OPEN, kernel_small)
+                
+                # 形态学操作：强力闭运算填充孔洞（连接断裂的皮毛纹理）
+                kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel_large)
+                
+                # 孔洞填充
+                mask_binary = binary_fill_holes(mask_binary).astype(np.float32)
+                
+                processed_masks.append(mask_binary)
+            
+            masks = processed_masks
+            
+            print(f"✅ 完成视频mask提取，共 {len(masks)} 帧")
+            
+        finally:
+            # 清理临时目录
+            if temp_dir is not None and Path(temp_dir).exists():
                 try:
-                    current_image_pil = Image.open(frame_path).convert("RGB")
-                    current_boxes = box_extractor.extract_boxes(current_image_pil, text_prompt)
-                    if len(current_boxes) > 0:
-                        # 确保boxes是numpy数组
-                        current_boxes = [np.array(b, dtype=np.float32) if not isinstance(b, np.ndarray) else b.astype(np.float32) for b in current_boxes]
-                        
-                        # 使用当前帧提取的边界框
-                        # 改进：如果提取到多个框，选择面积最大的（更可能包含完整目标）
-                        if len(current_boxes) > 1:
-                            areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in current_boxes]
-                            best_box_idx = np.argmax(areas)
-                            current_box = current_boxes[best_box_idx].copy()
-                            if i < 5 or i % 20 == 0:
-                                print(f"  📦 帧 {i}: 从 {len(current_boxes)} 个框中选择面积最大的")
-                        else:
-                            current_box = current_boxes[0].copy()
-                        
-                        # 使用当前帧的图像尺寸扩大边界框
-                        box_width = current_box[2] - current_box[0]
-                        box_height = current_box[3] - current_box[1]
-                        # 增加padding到30%，确保包含完整目标
-                        padding_x = max(box_width * 0.30, 40)  # 增加到30%，至少40像素
-                        padding_y = max(box_height * 0.30, 40)
-                        current_box[0] = max(0, current_box[0] - padding_x)
-                        current_box[1] = max(0, current_box[1] - padding_y)
-                        current_box[2] = min(img_w, current_box[2] + padding_x)
-                        current_box[3] = min(img_h, current_box[3] + padding_y)
-                        if i < 5 or i % 20 == 0:  # 只打印前5帧和每20帧
-                            print(f"  📦 帧 {i}: 从当前帧提取边界框 -> {current_box}")
-                    else:
-                        # 如果提取失败，使用初始框（仅作为fallback）
-                        if initial_box is not None:
-                            current_box = np.array(initial_box, dtype=np.float32) if not isinstance(initial_box, np.ndarray) else initial_box.astype(np.float32).copy()
-                            # 根据当前帧尺寸调整
-                            current_box[2] = min(img_w, current_box[2])
-                            current_box[3] = min(img_h, current_box[3])
-                            print(f"  ⚠️  帧 {i}: 边界框提取失败，使用初始框（已调整到当前帧尺寸）")
-                        else:
-                            raise ValueError(f"帧 {i}: 无法提取边界框且无初始框")
+                    shutil.rmtree(temp_dir)
+                    print(f"🗑️  已清理临时目录: {temp_dir}")
                 except Exception as e:
-                    # 如果提取失败，使用初始框（仅作为fallback）
-                    if initial_box is not None:
-                        current_box = np.array(initial_box, dtype=np.float32) if not isinstance(initial_box, np.ndarray) else initial_box.astype(np.float32).copy()
-                        current_box[2] = min(img_w, current_box[2])
-                        current_box[3] = min(img_h, current_box[3])
-                        print(f"  ⚠️  帧 {i}: 边界框提取出错，使用初始框（已调整）: {e}")
-                    else:
-                        raise ValueError(f"帧 {i}: 边界框提取失败: {e}")
-            else:
-                # 如果不启用独立提取，使用传入的boxes
-                if use_single_box:
-                    if initial_box is not None:
-                        current_box = np.array(initial_box, dtype=np.float32) if not isinstance(initial_box, np.ndarray) else initial_box.astype(np.float32).copy()
-                        # 根据当前帧尺寸调整
-                        current_box[2] = min(img_w, current_box[2])
-                        current_box[3] = min(img_h, current_box[3])
-                    else:
-                        current_box = None
-                elif len(boxes) > i:
-                    current_box = np.array(boxes[i], dtype=np.float32) if not isinstance(boxes[i], np.ndarray) else boxes[i].astype(np.float32).copy()
-                    current_box[2] = min(img_w, current_box[2])
-                    current_box[3] = min(img_h, current_box[3])
-                else:
-                    if len(boxes) > 0:
-                        current_box = np.array(boxes[-1], dtype=np.float32) if not isinstance(boxes[-1], np.ndarray) else boxes[-1].astype(np.float32).copy()
-                        current_box[2] = min(img_w, current_box[2])
-                        current_box[3] = min(img_h, current_box[3])
-                    else:
-                        current_box = None
-            
-            if current_box is None:
-                raise ValueError(f"第 {i} 帧没有对应的边界框")
-            
-            # 提取mask（使用高精度模式：多mask输出 + 9个点提示 + 集成推理）
-            mask, score = self.extract_mask_from_box(
-                image_rgb, current_box, 
-                use_multimask=True,
-                use_point_prompt=True,
-                high_precision_mode=high_precision_mode,  # 高精度模式（默认True）
-                ensemble_passes=ensemble_passes  # 集成推理次数（默认2）
-            )
-            
-            # 激进策略：使用非常低的阈值，优先保留所有可能的区域
-            # 自适应阈值：根据mask的置信度分布调整阈值
-            mask_mean = mask.mean()
-            mask_min = mask.min()
-            mask_max = mask.max()
-            mask_std = mask.std()
-            
-            # 更激进的阈值策略：大幅降低阈值
-            if mask_mean < 0.6:
-                # 置信度较低时，使用非常低的阈值
-                threshold = max(0.2, mask_mean - 0.2)  # 最低0.2，比之前更低
-            else:
-                threshold = 0.4  # 即使置信度高，也使用较低的阈值（从0.5降到0.4）
-            
-            # 改进：使用局部自适应阈值（边缘区域使用更低阈值）
-            # 创建边界框mask
-            box_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-            x1, y1, x2, y2 = map(int, current_box)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(img_w, x2), min(img_h, y2)
-            box_mask[y1:y2, x1:x2] = 1
-            
-            # 计算到边界框边缘的距离（用于边缘区域检测）
-            dist_to_edge = distance_transform_edt(box_mask)
-            
-            # 激进策略：边缘区域使用极低的阈值
-            # 在边界框边缘区域（距离边缘<50像素，扩大范围）使用更低的阈值
-            edge_mask_region = (dist_to_edge < 50) & (box_mask > 0)  # 扩大到50像素
-            if edge_mask_region.any():
-                edge_mean_confidence = mask[edge_mask_region].mean()
-                # 边缘区域使用极低的阈值
-                if edge_mean_confidence < 0.3:
-                    edge_threshold = max(0.15, edge_mean_confidence * 0.6)  # 非常激进
-                else:
-                    edge_threshold = max(0.2, threshold * 0.6)  # 边缘区域降低40%
-            else:
-                edge_threshold = threshold * 0.7
-            
-            # 使用更激进的策略：边缘区域几乎保留所有非零值
-            mask_binary = np.where(
-                (mask > threshold) | ((dist_to_edge < 50) & (mask > edge_threshold)),
-                1, 0
-            ).astype(np.uint8)
-            
-            # Debug输出：特别关注60帧后的变化
-            if i >= 60 and i <= 80:  # 60-80帧范围
-                mask_area_before = mask_binary.sum()
-                # 检查边界框是否在图像范围内
-                box_in_bounds = (
-                    0 <= current_box[0] < img_w and
-                    0 <= current_box[1] < img_h and
-                    0 < current_box[2] <= img_w and
-                    0 < current_box[3] <= img_h
-                )
-                # 计算边界框覆盖的图像比例
-                box_area = (current_box[2] - current_box[0]) * (current_box[3] - current_box[1])
-                box_coverage = box_area / (img_w * img_h)
-                
-                # 计算边缘区域的mask统计
-                edge_mask_region = (dist_to_edge < 50) & (box_mask > 0)
-                edge_mask_values = mask[edge_mask_region] if edge_mask_region.any() else np.array([])
-                edge_mean = edge_mask_values.mean() if len(edge_mask_values) > 0 else 0
-                
-                print(f"\n[帧 {i}] Debug信息 (激进策略):")
-                print(f"  边界框: [{current_box[0]:.1f}, {current_box[1]:.1f}, {current_box[2]:.1f}, {current_box[3]:.1f}]")
-                print(f"  边界框是否在图像内: {box_in_bounds}")
-                print(f"  边界框覆盖图像比例: {box_coverage:.2%}")
-                print(f"  SAM2置信度分数: {score:.4f}")
-                print(f"  Mask置信度统计: mean={mask_mean:.4f}, min={mask_min:.4f}, max={mask_max:.4f}, std={mask_std:.4f}")
-                print(f"  边缘区域(50px内)平均置信度: {edge_mean:.4f}")
-                print(f"  使用阈值: {threshold:.4f} (边缘区域: {edge_threshold:.4f})")
-                print(f"  二值化前mask面积: {mask_area_before} 像素")
-            
-            # 激进策略：多次膨胀+闭运算，优先填充所有空洞
-            # 第一步：先进行膨胀，连接断开的区域
-            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask_binary = cv2.dilate(mask_binary, kernel_dilate, iterations=1)
-            
-            # 第二步：多次闭运算，逐步填充空洞
-            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel_small)
-            
-            kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel_medium)
-            
-            kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel_large)
-            
-            # 第三步：使用更大的kernel进行闭运算（针对大空洞）
-            kernel_very_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-            mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel_very_large)
-            
-            # 第四步：再次膨胀边缘区域，确保边缘完整
-            edge_expand_mask = (dist_to_edge < 50) & (box_mask > 0)
-            if edge_expand_mask.any():
-                edge_mask_binary = mask_binary.copy()
-                edge_mask_binary[~edge_expand_mask] = 0
-                kernel_edge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                edge_mask_expanded = cv2.dilate(edge_mask_binary, kernel_edge, iterations=2)
-                mask_binary = np.maximum(mask_binary, edge_mask_expanded)
-            
-            # 连通域分析：选择最大连通域，过滤小的碎片区域
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-                mask_binary, connectivity=8
-            )
-            if num_labels > 1:
-                # 找到最大连通域（排除背景，索引0）
-                areas = stats[1:, cv2.CC_STAT_AREA]  # 跳过背景（索引0）
-                largest_label = np.argmax(areas) + 1  # +1因为跳过了背景
-                mask_binary = (labels == largest_label).astype(np.uint8)
-            
-            # 孔洞填充：填充mask内部的孔洞
-            mask_binary = binary_fill_holes(mask_binary).astype(np.float32)
-            
-            # Debug输出：形态学操作后的统计
-            if i >= 60 and i <= 80:
-                mask_area_after = mask_binary.sum()
-                # 计算空洞数量（连通域数量-1，减去背景）
-                num_labels_final, _, stats_final, _ = cv2.connectedComponentsWithStats(
-                    (mask_binary > 0.5).astype(np.uint8), connectivity=8
-                )
-                num_holes = num_labels_final - 1  # 减去背景
-                
-                # 计算mask在边界框内的分布
-                box_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                x1, y1, x2, y2 = map(int, current_box)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(img_w, x2), min(img_h, y2)
-                box_mask[y1:y2, x1:x2] = 1
-                
-                mask_in_box = (mask_binary > 0.5) & (box_mask > 0)
-                mask_out_box = (mask_binary > 0.5) & (box_mask == 0)
-                area_in_box = mask_in_box.sum()
-                area_out_box = mask_out_box.sum()
-                
-                print(f"  形态学操作后mask面积: {mask_area_after} 像素 (变化: {mask_area_after - mask_area_before:+d})")
-                print(f"  连通域数量: {num_labels_final} (空洞数: {num_holes})")
-                print(f"  Mask在边界框内面积: {area_in_box} 像素")
-                print(f"  Mask在边界框外面积: {area_out_box} 像素")
-                if mask_area_after > 0:
-                    print(f"  边界框外占比: {area_out_box / mask_area_after:.2%}")
-                
-                # 检查是否有明显空洞（面积突然下降）
-                # 检查mask质量（不依赖前帧，每帧独立评估）
-                if mask_area_after < 1000:  # 如果mask面积太小，可能是提取失败
-                    print(f"  ⚠️  Mask面积过小: {mask_area_after} 像素（可能提取失败）")
-                
-                print()
-            
-            # 保存debug可视化（如果启用了debug模式）
-            if debug_dir is not None and i in debug_frames:
-                self._save_debug_visualization(
-                    image_rgb, current_box, mask, mask_binary, threshold, i, debug_dir
-                )
-            
-            masks.append(mask_binary)
+                    print(f"⚠️  清理临时目录失败: {e}")
         
-        # 转换为numpy数组并保存缓存
-        masks_array = np.array(masks)
-        print(f"\n💾 保存mask缓存到: {cache_path}")
-        torch.save(torch.from_numpy(masks_array), str(cache_path))
-        print(f"✅ 已保存 {len(masks_array)} 个mask到缓存")
+        # 保存缓存
+        if use_cache:
+            print(f"💾 保存mask缓存到: {cache_path}")
+            torch.save(torch.from_numpy(np.array(masks)), str(cache_path))
+            print(f"✅ 已保存 {len(masks)} 个mask到缓存")
         
         # 保存可视化结果
         if save_visualization:
             vis_dir = result_dir / "mask" / target_name
             print(f"🎨 保存可视化结果到: {vis_dir}")
-            self._save_visualizations(masks_array, frame_paths, target_name, result_dir)
-            print(f"✅ 已保存 {len(masks_array)} 个可视化图像")
+            self._save_visualizations(masks, frame_paths, target_name, result_dir)
+            print(f"✅ 已保存 {len(masks)} 个可视化图像")
         
-        return masks_array
+        # 生成debug图像（如果需要）
+        if debug_dir is not None and len(debug_frames) > 0:
+            print(f"🐛 生成debug图像...")
+            for i in debug_frames:
+                if i < len(frame_paths) and i < len(masks):
+                    try:
+                        # 读取图像
+                        image = cv2.imread(str(frame_paths[i]))
+                        if image is None:
+                            continue
+                        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                        
+                        # 使用提取的mask
+                        mask_binary = masks[i]
+                        
+                        # 保存debug可视化（使用-1.0阈值标记，实际mask已处理后处理）
+                        self._save_debug_visualization(
+                            image_rgb, initial_box, mask_binary, mask_binary, -1.0, i, debug_dir
+                        )
+                    except Exception as e:
+                        print(f"  ⚠️  生成帧 {i} 的debug图像时出错: {e}")
+        
+        return np.array(masks)
     
     def _save_debug_visualization(
         self,
@@ -932,8 +781,8 @@ def extract_masks_from_text_prompt(
         sam2_checkpoint_path: SAM2检查点路径
         save_visualization: 是否保存可视化结果
         use_cache: 是否使用缓存
-        high_precision_mode: 高精度模式，使用更多计算提升精度（图像1.5倍分辨率，9个点提示），默认False
-        ensemble_passes: 集成推理次数，多次推理并融合结果，默认1（建议2-3次）
+        high_precision_mode: 高精度模式（保持兼容性，影响集成推理），默认True
+        ensemble_passes: 集成推理次数，多次推理并融合结果，默认2（建议2-3次）
     
     Returns:
         (masks, boxes) 元组，masks为mask数组（形状为(N, H, W)），boxes为边界框列表
@@ -1005,29 +854,17 @@ def extract_masks_from_text_prompt(
     # Debug模式：自动检测60-80帧
     debug_frames = list(range(60, 81))  # 60-80帧用于debug
     
-    # 每帧独立：从每帧提取边界框（不使用共享的reference_box）
-    # 高精度模式（已内置，默认启用）
-    print(f"\n🚀 高精度模式（已内置）:")
-    print(f"   ✅ 图像分辨率提升1.5倍")
-    print(f"   ✅ 使用9个点提示（标准模式5个）")
-    print(f"   ✅ 集成推理: {ensemble_passes}次推理并融合结果")
-    print()
-    
     masks = mask_extractor.extract_masks_from_video(
         frame_paths=frame_paths,
-        boxes=[reference_box] * len(frame_paths),  # 仅作为fallback，实际每帧会重新提取
+        boxes=[reference_box],  # 使用扩大后的边界框
         target_name=target_name,
         save_visualization=save_visualization,
         use_cache=use_cache,
         debug_frames=debug_frames,
-        update_box_interval=None,  # 不使用间隔更新，改为每帧独立提取
-        box_extractor=box_extractor,  # 传入边界框提取器
-        text_prompt=text_prompt,  # 传入文本提示
-        high_precision_mode=high_precision_mode,  # 高精度模式
-        ensemble_passes=ensemble_passes  # 集成推理次数
+        high_precision_mode=high_precision_mode,
+        ensemble_passes=ensemble_passes
     )
     
-    # 显示最终保存的目录
     print("\n" + "=" * 60)
     print("📂 最终保存目录:")
     cache_path = cache_dir / "mask" / f"{target_name}.pt"
@@ -1037,7 +874,7 @@ def extract_masks_from_text_prompt(
         print(f"  🎨 可视化结果: {vis_dir}")
     print("=" * 60)
     
-    return masks, boxes
+    return masks, [reference_box]
 
 
 if __name__ == "__main__":
@@ -1083,106 +920,25 @@ if __name__ == "__main__":
         help="SAM2检查点路径（默认: 使用项目默认路径）"
     )
     parser.add_argument(
-        "--high_precision",
-        action="store_true",
-        default=True,  # 默认启用
-        help="启用高精度模式：图像分辨率提升1.5倍，使用9个点提示（已内置，默认启用）"
-    )
-    parser.add_argument(
         "--ensemble_passes",
         type=int,
         default=2,  # 默认2次
         help="集成推理次数，多次推理并融合结果（默认: 2，建议2-3次以获得更高精度）"
     )
-    parser.add_argument(
-        "--disable_high_precision",
-        action="store_true",
-        help="禁用高精度模式（如果不需要最高精度，可以禁用以提升速度）"
-    )
     
     args = parser.parse_args()
     
-    # 获取项目路径
-    base, config_dir, cache_dir, frame_dir, result_dir, _ = build_project_paths()
-    target_name = args.target_name if args.target_name else get_target_name(frame_dir)
+    # 调用提取函数
+    ensemble_count = args.ensemble_passes if hasattr(args, 'ensemble_passes') else 2
+    masks, boxes = extract_masks_from_text_prompt(
+        text_prompt=args.text_prompt,
+        target_name=args.target_name,
+        sam2_config_path=args.sam2_config,
+        sam2_checkpoint_path=args.sam2_checkpoint,
+        save_visualization=not args.no_visualization,
+        use_cache=not args.no_cache,
+        high_precision_mode=True,  # 保持兼容性，但不再使用Resize
+        ensemble_passes=ensemble_count
+    )
     
-    print("=" * 60)
-    print("Mask提取工具 - 基于Florence-2和SAM2")
-    print("=" * 60)
-    print(f"项目根目录: {base}")
-    print(f"配置目录: {config_dir}")
-    print(f"缓存目录: {cache_dir}")
-    print(f"帧图像目录: {frame_dir}")
-    print(f"结果目录: {result_dir}")
-    print(f"目标名称: {target_name}")
-    print(f"文本提示: {args.text_prompt}")
-    print("=" * 60)
-    
-    # 检查帧目录是否存在
-    if not frame_dir.exists():
-        raise FileNotFoundError(f"帧图像目录不存在: {frame_dir}")
-    
-    # 检查是否有图像文件
-    frame_paths = sorted([
-        p for p in frame_dir.iterdir()
-        if p.suffix.lower() in (".jpg", ".png")
-    ])
-    
-    if len(frame_paths) == 0:
-        raise ValueError(f"在 {frame_dir} 中未找到图像文件（.jpg 或 .png）")
-    
-    print(f"\n找到 {len(frame_paths)} 帧图像")
-    print(f"第一帧: {frame_paths[0].name}")
-    print(f"最后一帧: {frame_paths[-1].name}")
-    
-    try:
-        # 提取mask
-        print(f"\n开始提取mask...")
-        # 高精度模式已内置（默认启用），可通过命令行参数禁用
-        high_precision = not args.disable_high_precision if hasattr(args, 'disable_high_precision') else True
-        ensemble_count = args.ensemble_passes if hasattr(args, 'ensemble_passes') else 2
-        
-        masks, boxes = extract_masks_from_text_prompt(
-            text_prompt=args.text_prompt,
-            target_name=target_name,
-            sam2_config_path=args.sam2_config,
-            sam2_checkpoint_path=args.sam2_checkpoint,
-            save_visualization=not args.no_visualization,
-            use_cache=not args.no_cache,
-            high_precision_mode=high_precision,
-            ensemble_passes=ensemble_count
-        )
-        
-        print("\n" + "=" * 60)
-        print("✅ Mask提取完成！")
-        print("=" * 60)
-        print(f"提取的mask数量: {len(masks)}")
-        print(f"Mask形状: {masks.shape}")
-        print(f"找到的边界框数量: {len(boxes)}")
-        if len(boxes) > 0:
-            print(f"第一个边界框: {boxes[0]}")
-        
-        # 显示保存路径
-        cache_path = cache_dir / "mask" / f"{target_name}.pt"
-        print(f"\n缓存文件: {cache_path}")
-        if cache_path.exists():
-            print(f"  ✅ 已保存")
-        else:
-            print(f"  ⚠️  未找到（可能未启用缓存）")
-        
-        if not args.no_visualization:
-            vis_dir = result_dir / "mask" / target_name
-            print(f"\n可视化结果目录: {vis_dir}")
-            if vis_dir.exists():
-                vis_files = list(vis_dir.glob("*_mask.png"))
-                print(f"  ✅ 已保存 {len(vis_files)} 个可视化图像")
-            else:
-                print(f"  ⚠️  目录不存在")
-        
-        print("\n" + "=" * 60)
-        
-    except Exception as e:
-        print(f"\n❌ 错误: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    print(f"\n✅ 完成！共提取 {len(masks)} 个mask")
