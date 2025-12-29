@@ -18,3 +18,5 @@ snapping:
   lambda_deform: 1.0  # 形变项的权重（使用论文原始值）
   lambda_velocity: 0.0  # 速度约束项的权重（已禁用，仅保留核心算法）
   lambda_length: 0.0  # 长度约束项的权重（已禁用，仅保留核心算法）
+  erode_size: 2
+  dilate_size: 2

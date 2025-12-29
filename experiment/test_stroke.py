@@ -53,7 +53,7 @@ class StrokeEnvironment:
         """Path to the optical-flow cache tensor for the current target."""
 
         return self.paths.cache / "flow-dilate" / f"{self.target_name}.pt"
-    
+
     @property
     def mask_cache_file(self) -> Path:
         """Path to the original mask cache tensor for the current target."""
@@ -66,11 +66,11 @@ class StrokeEnvironment:
 
         return self.paths.result / "salient" / self.target_name
 
-    @property
-    def salient_stroke_dir(self) -> Path:
-        """Directory used to dump salient stroke groups for debugging."""
-
-        return self.paths.result / "salient" / self.target_name
+    # @property
+    # def salient_stroke_dir(self) -> Path:
+    #     """Directory used to dump salient stroke groups for debugging."""
+    #
+    #     return self.paths.result / "salient" / self.target_name
 
 
 @dataclass
@@ -79,7 +79,7 @@ class ViewerState:
 
     current_frame: int = 0
     current_stroke_index: int = 2  # 默认使用3号stroke（索引从0开始，3号对应索引2）
-    show_origin: bool = True
+    show_origin: bool = False
     show_flow: bool = False
     show_snapping: bool = False
     show_fitted: bool = True
@@ -165,7 +165,7 @@ def load_environment() -> StrokeEnvironment:
     # 使用path_utils中的函数获取所有路径信息
     base, config_dir, cache_dir, frame_dir, result_dir, stroke_dir = build_project_paths_from_utils()
     target_name = get_target_name(frame_dir)
-    
+
     # 构建ProjectPaths实例
     paths = ProjectPaths(
         base=base,
@@ -175,7 +175,7 @@ def load_environment() -> StrokeEnvironment:
         debug=base / "debug",  # debug目录独立于result_dir
         result=result_dir,  # results目录
     )
-    
+
     return StrokeEnvironment(
         paths=paths,
         frame_dir=frame_dir,
@@ -253,13 +253,13 @@ def erode_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
         mask_uint8 = (mask * 255).astype(np.uint8)
     else:
         mask_uint8 = mask
-    
+
     # 创建圆形结构元素
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
-    
+
     # 执行腐蚀操作
     eroded = cv2.erode(mask_uint8, kernel, iterations=1)
-    
+
     # 转换回0-1范围
     return (eroded / 255.0).astype(np.float32)
 
@@ -280,13 +280,13 @@ def dilate_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
         mask_uint8 = (mask * 255).astype(np.uint8)
     else:
         mask_uint8 = mask
-    
+
     # 创建圆形结构元素
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
-    
+
     # 执行膨胀操作
     dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
-    
+
     # 转换回0-1范围
     return (dilated / 255.0).astype(np.float32)
 
@@ -305,23 +305,23 @@ def filter_points_by_mask(points: np.ndarray, mask: np.ndarray, keep_inside: boo
     """
     if len(points) == 0:
         return points
-    
+
     H, W = mask.shape
-    
+
     # 将点坐标转换为整数索引
     x_coords = points[:, 0].astype(np.int32)
     y_coords = points[:, 1].astype(np.int32)
-    
+
     # 边界检查
     valid_indices = (x_coords >= 0) & (x_coords < W) & (y_coords >= 0) & (y_coords < H)
-    
+
     if not valid_indices.any():
         return np.array([], dtype=np.float32).reshape(0, 2)
-    
+
     # 获取mask值（物体内部为1，外部为0）
     mask_values = np.zeros(len(points), dtype=np.float32)
     mask_values[valid_indices] = mask[y_coords[valid_indices], x_coords[valid_indices]]
-    
+
     # 根据keep_inside参数决定保留哪些点
     if keep_inside:
         # 保留mask内部的点（mask值为1的点）
@@ -329,7 +329,7 @@ def filter_points_by_mask(points: np.ndarray, mask: np.ndarray, keep_inside: boo
     else:
         # 保留mask外部的点（mask值为0的点）
         filtered_indices = mask_values < 0.5
-    
+
     return points[filtered_indices]
 
 
@@ -345,16 +345,16 @@ def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[
         cv2.imwrite(str(file_path), canvas)
 
 
-def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates: List[np.ndarray], height: int, width: int, i_frame: int) -> None:
-    """Dump stroke-wise salient candidates for a particular frame."""
-
-    canvas = np.zeros((height, width), np.uint8)
-    for i_group in range(len(points_stroke_candidates)):
-        canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
-    work_dir = env.salient_stroke_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    file_path = work_dir / f"{i_frame:03d}.jpg"
-    cv2.imwrite(str(file_path), canvas)
+# def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates: List[np.ndarray], height: int, width: int, i_frame: int) -> None:
+#     """Dump stroke-wise salient candidates for a particular frame."""
+#
+#     canvas = np.zeros((height, width), np.uint8)
+#     for i_group in range(len(points_stroke_candidates)):
+#         canvas[points_stroke_candidates[i_group][:, 1], points_stroke_candidates[i_group][:, 0]] = 255
+#     work_dir = env.salient_stroke_dir
+#     work_dir.mkdir(parents=True, exist_ok=True)
+#     file_path = work_dir / f"{i_frame:03d}.jpg"
+#     cv2.imwrite(str(file_path), canvas)
 
 
 def rgb_to_bgr(color: tuple) -> tuple:
@@ -386,7 +386,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
     # 预先计算H和W，避免每次循环重复计算
     H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
     n_frames = data.images_rgb.shape[0]
-    
+
     # 使用mininterval减少tqdm更新频率，提高性能
     for i in tqdm(range(n_frames - 1), desc="Generating prediction strokes on subsequent frames:", unit=" batch", mininterval=0.5):
         i_frame = i + 1
@@ -416,7 +416,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.snapping[i_frame] = stroke_snapping
-        
+
         # 在每次local_snapping调用后立即清理GPU缓存，防止累积
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -428,14 +428,14 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         # 光流传播：从 frame i-1 到 frame i
         # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
         # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
-        
+
         if i == 0 or buffers.flow[i_frame - 1] is None:
             x, y = stroke_copied[:, 0], stroke_copied[:, 1]
             previous_flow = stroke_copied
         else:
             previous_flow = buffers.flow[i_frame - 1]
             x, y = previous_flow[:, 0], previous_flow[:, 1]
-        
+
         # 边界检查：确保索引在有效范围内
         x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
         y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
@@ -449,7 +449,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
         flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
         stroke_fitted = stroke_copied + flow_vectors_fit
-        
+
         # 光流传播后立即进行长度归一化，防止长度变化累积（已禁用，仅保留核心算法）
         # 使用向量化计算，避免循环
         # if data.original_stroke_length is not None and data.original_stroke_length > 1e-6:
@@ -463,7 +463,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         #         # 以第一个点为基准进行缩放（向量化）
         #         center = stroke_fitted[0]
         #         stroke_fitted = center + (stroke_fitted - center) * scale_factor
-        
+
         # 使用过滤后的候选点进行fitted传播
         points_stroke_candidate_fitted = data.kd_tree.query_batch(
             i_frame,
@@ -482,7 +482,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
         )
         buffers.fitted[i_frame] = stroke_fitted
-        
+
         # 在每次local_snapping调用后立即清理GPU缓存，防止累积
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -490,7 +490,7 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
             if i_frame % 10 == 0:
                 torch.cuda.reset_peak_memory_stats()
-        
+
         # 定期清理Python对象和GPU内存，防止累积
         if i % 5 == 0:  # 每5帧清理一次（提高清理频率）
             gc.collect()
@@ -506,7 +506,7 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
     buffers.flow[0] = None
     buffers.snapping[0] = None
     buffers.fitted[0] = None
-    
+
     # 计算第一帧原始stroke的长度（用于长度约束）
     if data.original_stroke_length is None:
         original_length = 0.0
@@ -514,7 +514,7 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
             original_length += np.linalg.norm(stroke_initial[i + 1] - stroke_initial[i])
         # 更新data中的原始长度
         data.original_stroke_length = original_length if original_length > 1e-6 else None
-    
+
     generate_prediction_stroke_on_0(buffers, data, stroke_initial)
     generate_prediction_strokes_subsequent(buffers, data)
 
@@ -622,11 +622,11 @@ def build_runtime_context() -> RuntimeContext:
     print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
-    
+
     # 保存未过滤的候选点（用于纯光流和纯吸附）
     # 使用列表推导式深拷贝每个numpy数组
     points_all_candidates_unfiltered = [points.copy() for points in points_all_candidates]
-    
+
     # 使用原始mask进行双重过滤：
     # 1. 腐蚀3个像素，过滤掉物体内部的点
     # 2. 膨胀3个像素，过滤掉物体外部的点
@@ -635,39 +635,39 @@ def build_runtime_context() -> RuntimeContext:
         masks_original = read_mask_cache(env)
         print(f"Loaded original mask cache: {masks_original.shape}, {masks_original.dtype}")
         # print("使用原始mask进行双重过滤（腐蚀3像素过滤内部点，膨胀3像素过滤外部点）...")
-        
-        erode_size = 3
-        dilate_size = 3
-        
+
+        erode_size = EdgeSnappingConfig.erode_size
+        dilate_size = EdgeSnappingConfig.dilate_size
+
         points_all_candidates_filtered = []
         for i in tqdm(range(len(points_all_candidates)), desc="Filtering Salient Points", unit=" frame(s)"):
             if i < masks_original.shape[0]:
                 mask_original = masks_original[i]
-                
+
                 # 对原始mask进行腐蚀（用于过滤内部点）
                 mask_eroded = erode_mask(mask_original, erode_size)
-                
+
                 # 对原始mask进行膨胀（用于过滤外部点）
                 mask_dilated = dilate_mask(mask_original, dilate_size)
-                
+
                 # 第一步：使用腐蚀mask过滤掉物体内部的点（保留外部点）
                 points_after_erode = filter_points_by_mask(points_all_candidates[i], mask_eroded, keep_inside=False)
-                
+
                 # 第二步：使用膨胀mask过滤掉物体外部的点（保留内部点）
                 points_filtered = filter_points_by_mask(points_after_erode, mask_dilated, keep_inside=True)
-                
+
                 points_all_candidates_filtered.append(points_filtered)
                 # print(f"  帧 {i}: {len(points_all_candidates[i])} -> {len(points_after_erode)} (腐蚀后) -> {len(points_filtered)} (最终) 个点")
             else:
                 # 如果mask帧数不够，使用原始点
                 points_all_candidates_filtered.append(points_all_candidates[i])
-        
+
         points_all_candidates = points_all_candidates_filtered
         # print("✅ 点过滤完成")
     except ValueError as e:
         print(f"⚠️  警告: {e}")
         print("   将使用未过滤的点")
-    
+
     generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
     kd_tree_groups = BatchKDTree(points_all_candidates)
     # 为未过滤的候选点创建 kd_tree（用于纯光流和纯吸附）

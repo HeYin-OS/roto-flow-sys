@@ -78,6 +78,8 @@ class EdgeSnappingConfig:
     lambda_deform = None  # 形变项的权重（用于增强形变控制）
     lambda_velocity = None  # 速度项的权重（防止过大的位移）
     lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）
+    erode_size = None
+    dilate_size = None
 
     fdog_kernel = None
     gaussian_kernel = None
@@ -111,6 +113,8 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.lambda_deform = s.get('lambda_deform', 1.0)  # 默认值1.0
         EdgeSnappingConfig.lambda_velocity = s.get('lambda_velocity', 0.5)  # 默认值0.5（强化后的默认值）
         EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2
+        EdgeSnappingConfig.erode_size = s['erode_size']
+        EdgeSnappingConfig.dilate_size = s['dilate_size']
 
         EdgeSnappingConfig.isConfigInit = True
 
