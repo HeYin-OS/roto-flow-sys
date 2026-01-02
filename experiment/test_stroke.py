@@ -18,6 +18,7 @@ from utils.path_utils import build_project_paths as build_project_paths_from_uti
 COLOR_ORIGIN = (255, 255, 0)  # Vivid Orange
 COLOR_FLOW = (200, 130, 255)  # Soft Lavender
 COLOR_SNAPPING = (0, 150, 255)  # Tech Blue
+COLOR_FLOW_SNAPPED = (255, 100, 0)  # Orange Red
 COLOR_FITTED = (50, 200, 50)  # Fresh Green
 THICKNESS = 2
 
@@ -80,9 +81,10 @@ class ViewerState:
     current_frame: int = 0
     current_stroke_index: int = 2  # 默认使用3号stroke（索引从0开始，3号对应索引2）
     show_origin: bool = False
-    show_flow: bool = False
-    show_snapping: bool = False
-    show_fitted: bool = True
+    show_snapping: bool = False  # z键：纯吸附结果
+    show_flow: bool = False  # x键：纯光流结果
+    show_flow_snapped: bool = False  # c键：光流吸附结果
+    show_fitted: bool = True  # v键：fitted结果
 
 
 @dataclass
@@ -91,6 +93,7 @@ class StrokeBuffers:
 
     flow: List[np.ndarray | None] = field(default_factory=list)
     snapping: List[np.ndarray | None] = field(default_factory=list)
+    flow_snapped: List[np.ndarray | None] = field(default_factory=list)
     fitted: List[np.ndarray | None] = field(default_factory=list)
 
     def reset(self, n_frame: int) -> None:
@@ -98,6 +101,7 @@ class StrokeBuffers:
 
         self.flow = [None] * n_frame
         self.snapping = [None] * n_frame
+        self.flow_snapped = [None] * n_frame
         self.fitted = [None] * n_frame
 
 
@@ -398,6 +402,9 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     # 生成flow结果（第0帧没有光流，所以直接使用fitted结果）
     buffers.flow[0] = stroke_0_snapped.astype(np.float32)
 
+    # 生成flow_snapped结果（第0帧使用未过滤点集的吸附结果）
+    buffers.flow_snapped[0] = stroke_0_snapping.astype(np.float32)
+
 
 def generate_snapping_prediction(
     i_frame: int,
@@ -493,6 +500,69 @@ def generate_flow_prediction(
     return stroke_flow
 
 
+def generate_flow_snapped_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    生成当前帧的flow_snapped预测结果。
+    先进行光流传播，再进行吸附（使用未过滤的候选点）。
+    使用自身的数据进行传播，如果是第一帧则使用第0帧的结果。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的fitted stroke（未使用，保留以保持接口一致）
+        buffers: 存储预测结果的缓冲区
+        data: 包含图像、光流和KD树的数据
+        H: 图像高度
+        W: 图像宽度
+    
+    Returns:
+        当前帧的flow_snapped预测结果
+    """
+    # 使用自身的数据进行传播
+    # 如果是第一帧（i_frame=1），使用第0帧的flow_snapped结果
+    previous_flow_snapped = buffers.flow_snapped[i_frame - 1]
+    if previous_flow_snapped is None:
+        raise RuntimeError(f"Missing flow_snapped stroke for frame {i_frame - 1}")
+
+    # 第一步：光流传播
+    # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
+    x, y = previous_flow_snapped[:, 0], previous_flow_snapped[:, 1]
+
+    # 边界检查：确保索引在有效范围内
+    x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
+    y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
+    flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
+    stroke_after_flow = previous_flow_snapped + flow_vectors
+
+    # 第二步：使用未过滤的候选点进行吸附
+    points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
+        i_frame,
+        stroke_after_flow,
+        EdgeSnappingConfig.r_s,
+    )
+
+    # 获取前一帧的flow_snapped结果用于速度约束
+    previous_snapped_stroke = buffers.flow_snapped[i_frame - 1] if i > 0 else None
+    
+    stroke_flow_snapped = local_snapping(
+        stroke_after_flow,
+        data.images_rgb[i_frame],
+        points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
+        previous_snapped_stroke=previous_snapped_stroke,
+        original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+    )
+    
+    return stroke_flow_snapped
+
+
 def generate_fitted_prediction(
     i_frame: int,
     i: int,
@@ -581,6 +651,20 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         )
         buffers.flow[i_frame] = stroke_flow
 
+        # 生成flow_snapped预测结果
+        stroke_flow_snapped = generate_flow_snapped_prediction(
+            i_frame, i, stroke_copied, buffers, data, H, W
+        )
+        buffers.flow_snapped[i_frame] = stroke_flow_snapped
+
+        # 在每次local_snapping调用后立即清理GPU缓存，防止累积
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
+            if i_frame % 10 == 0:
+                torch.cuda.reset_peak_memory_stats()
+
         # 生成fitted预测结果
         stroke_fitted = generate_fitted_prediction(
             i_frame, i, stroke_copied, buffers, data, H, W
@@ -607,7 +691,7 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
 
     n_frame = data.images_rgb.shape[0]
     buffers.reset(n_frame)
-    # 注意：第0帧的flow、snapping和fitted会在generate_prediction_stroke_on_0中初始化
+    # 注意：第0帧的flow、snapping、flow_snapped和fitted会在generate_prediction_stroke_on_0中初始化
 
     # 计算第一帧原始stroke的长度（用于长度约束）
     if data.original_stroke_length is None:
@@ -640,6 +724,10 @@ def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
     if stroke_snapping is not None and state.show_snapping:
         cv2.polylines(canvas, [stroke_snapping.astype(np.int32)], False, rgb_to_bgr(COLOR_SNAPPING), THICKNESS, lineType=cv2.LINE_AA)
 
+    stroke_flow_snapped = buffers.flow_snapped[state.current_frame]
+    if stroke_flow_snapped is not None and state.show_flow_snapped:
+        cv2.polylines(canvas, [stroke_flow_snapped.astype(np.int32)], False, rgb_to_bgr(COLOR_FLOW_SNAPPED), THICKNESS, lineType=cv2.LINE_AA)
+
     stroke_fitted = buffers.fitted[state.current_frame]
     if stroke_fitted is not None and state.show_fitted:
         cv2.polylines(canvas, [stroke_fitted.astype(np.int32)], False, rgb_to_bgr(COLOR_FITTED), THICKNESS, lineType=cv2.LINE_AA)
@@ -667,6 +755,7 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
         ("fitted", buffers.fitted, COLOR_FITTED),
         ("flow", buffers.flow, COLOR_FLOW),
         ("snapping", buffers.snapping, COLOR_SNAPPING),
+        ("flow_snapped", buffers.flow_snapped, COLOR_FLOW_SNAPPED),
     )
 
     for name, strokes, color_rgb in stroke_categories:
@@ -818,22 +907,26 @@ def main():
         return False
 
     @registry.register('z')
-    def toggle_origin_visibility() -> bool:
-        viewer.show_origin = not viewer.show_origin
+    def toggle_snapping_visibility() -> bool:
+        """z键：切换纯吸附结果（snapping）的显示"""
+        viewer.show_snapping = not viewer.show_snapping
         return False
 
     @registry.register('x')
     def toggle_flow_visibility() -> bool:
+        """x键：切换纯光流结果（flow）的显示"""
         viewer.show_flow = not viewer.show_flow
         return False
 
     @registry.register('c')
-    def toggle_snapping_visibility() -> bool:
-        viewer.show_snapping = not viewer.show_snapping
+    def toggle_flow_snapped_visibility() -> bool:
+        """c键：切换光流吸附结果（flow_snapped）的显示"""
+        viewer.show_flow_snapped = not viewer.show_flow_snapped
         return False
 
     @registry.register('v')
     def toggle_fitted_visibility() -> bool:
+        """v键：切换fitted结果的显示"""
         viewer.show_fitted = not viewer.show_fitted
         return False
 
