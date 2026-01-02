@@ -213,8 +213,13 @@ def read_strokes(env: StrokeEnvironment) -> List[np.ndarray]:
         path = env.stroke_dir / f"stroke_{i:02d}.npy"
         if not path.exists():
             break
-        strokes.append(np.load(str(path)).astype(np.float32))
-        print(f"Loaded stroke from:  {path}")
+        stroke = np.load(str(path)).astype(np.float32)
+        strokes.append(stroke)
+        print(f"Loaded stroke from:  {path}, shape: {stroke.shape}, dtype: {stroke.dtype}")
+    if strokes:
+        print(f"Total strokes loaded: {len(strokes)}")
+        for idx, stroke in enumerate(strokes):
+            print(f"  Stroke {idx + 1}: shape={stroke.shape}, dtype={stroke.dtype}, num_points={len(stroke)}")
     return strokes
 
 
@@ -428,6 +433,17 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
 
     # 生成flow_snapped结果（第0帧使用未过滤点集的吸附结果）
     buffers.flow_snapped[0] = stroke_0_snapping.astype(np.float32)
+    
+    # 输出第0帧四种预测结果的形状
+    print("\n" + "=" * 60)
+    print("Frame 0 预测结果形状:")
+    print("=" * 60)
+    print(f"  Original stroke shape: {stroke_0.shape}, dtype: {stroke_0.dtype}")
+    print(f"  Snapping shape: {buffers.snapping[0].shape}, dtype: {buffers.snapping[0].dtype}")
+    print(f"  Flow shape: {buffers.flow[0].shape}, dtype: {buffers.flow[0].dtype}")
+    print(f"  Flow_snapped shape: {buffers.flow_snapped[0].shape}, dtype: {buffers.flow_snapped[0].dtype}")
+    print(f"  Fitted shape: {buffers.fitted[0].shape}, dtype: {buffers.fitted[0].dtype}")
+    print("=" * 60 + "\n")
 
 
 def generate_snapping_prediction(
@@ -717,6 +733,15 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
     buffers.reset(n_frame)
     # 注意：第0帧的flow、snapping、flow_snapped和fitted会在generate_prediction_stroke_on_0中初始化
 
+    # 输出输入笔画数据的形状
+    print("\n" + "=" * 60)
+    print("输入笔画数据信息:")
+    print("=" * 60)
+    print(f"  Stroke initial shape: {stroke_initial.shape}, dtype: {stroke_initial.dtype}")
+    print(f"  Number of points: {len(stroke_initial)}")
+    print(f"  Total frames: {n_frame}")
+    print("=" * 60 + "\n")
+
     # 计算第一帧原始stroke的长度（用于长度约束）
     if data.original_stroke_length is None:
         original_length = 0.0
@@ -727,6 +752,45 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
 
     generate_prediction_stroke_on_0(buffers, data, stroke_initial)
     generate_prediction_strokes_subsequent(buffers, data)
+    
+    # 输出所有帧的预测结果形状统计
+    print("\n" + "=" * 60)
+    print("所有帧预测结果形状统计:")
+    print("=" * 60)
+    
+    # 统计每种预测结果的形状
+    snapping_shapes = [buffers.snapping[i].shape if buffers.snapping[i] is not None else None for i in range(n_frame)]
+    flow_shapes = [buffers.flow[i].shape if buffers.flow[i] is not None else None for i in range(n_frame)]
+    flow_snapped_shapes = [buffers.flow_snapped[i].shape if buffers.flow_snapped[i] is not None else None for i in range(n_frame)]
+    fitted_shapes = [buffers.fitted[i].shape if buffers.fitted[i] is not None else None for i in range(n_frame)]
+    
+    # 找出所有不同的形状
+    unique_snapping = set(s for s in snapping_shapes if s is not None)
+    unique_flow = set(s for s in flow_shapes if s is not None)
+    unique_flow_snapped = set(s for s in flow_snapped_shapes if s is not None)
+    unique_fitted = set(s for s in fitted_shapes if s is not None)
+    
+    print(f"  Snapping shapes: {unique_snapping}")
+    print(f"  Flow shapes: {unique_flow}")
+    print(f"  Flow_snapped shapes: {unique_flow_snapped}")
+    print(f"  Fitted shapes: {unique_fitted}")
+    
+    # 统计每帧的点数
+    print("\n各帧点数统计 (前5帧和后5帧):")
+    for i in range(min(5, n_frame)):
+        if buffers.snapping[i] is not None:
+            print(f"  Frame {i:03d}: snapping={len(buffers.snapping[i])}, flow={len(buffers.flow[i]) if buffers.flow[i] is not None else 0}, "
+                  f"flow_snapped={len(buffers.flow_snapped[i]) if buffers.flow_snapped[i] is not None else 0}, "
+                  f"fitted={len(buffers.fitted[i]) if buffers.fitted[i] is not None else 0}")
+    if n_frame > 10:
+        print("  ...")
+        for i in range(max(5, n_frame - 5), n_frame):
+            if buffers.snapping[i] is not None:
+                print(f"  Frame {i:03d}: snapping={len(buffers.snapping[i])}, flow={len(buffers.flow[i]) if buffers.flow[i] is not None else 0}, "
+                      f"flow_snapped={len(buffers.flow_snapped[i]) if buffers.flow_snapped[i] is not None else 0}, "
+                      f"fitted={len(buffers.fitted[i]) if buffers.fitted[i] is not None else 0}")
+    
+    print("=" * 60 + "\n")
 
 
 def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
