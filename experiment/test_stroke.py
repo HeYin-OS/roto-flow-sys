@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 import gc
+import shutil
 
 import cv2
 import numpy as np
@@ -356,12 +357,19 @@ def filter_points_by_mask(points: np.ndarray, mask: np.ndarray, keep_inside: boo
 def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[np.ndarray], height: int, width: int) -> None:
     """Dump salient edge candidate maps for debugging or offline inspection."""
 
+    work_dir = env.salient_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
     for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
         canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
-        work_dir = env.salient_dir
-        work_dir.mkdir(parents=True, exist_ok=True)
-        file_path = work_dir / f"{i_img:03d}.jpg"
+        file_path = work_dir / f"{i_img:03d}.png"
         cv2.imwrite(str(file_path), canvas)
 
 
@@ -777,11 +785,17 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     for name, strokes, color_rgb in stroke_categories:
         frames_bgr: List[np.ndarray] = []
         
-        # 创建该策略的JPG图片目录
-        jpg_dir = target_dir / name
-        jpg_dir.mkdir(parents=True, exist_ok=True)
+        # 创建该策略的PNG图片目录
+        png_dir = target_dir / name
+        png_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 清空目录中的文件（不删除目录）
+        if png_dir.exists():
+            for file_path in png_dir.iterdir():
+                if file_path.is_file():
+                    file_path.unlink()
 
-        for idx in tqdm(range(n_frame), desc=f"Building {name} GIF and JPGs", unit=" frame(s)"):
+        for idx in tqdm(range(n_frame), desc=f"Building {name} GIF and PNGs", unit=" frame(s)"):
             background = cv2.cvtColor(data.images_rgb[idx], cv2.COLOR_RGB2BGR)
             stroke_data = strokes[idx]
             if stroke_data is not None:
@@ -795,10 +809,10 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
                 )
             frames_bgr.append(background)
             
-            # 保存JPG图片，命名格式：[策略名_5位0填充的帧号].jpg
-            jpg_filename = f"{name}_{idx:05d}.jpg"
-            jpg_path = jpg_dir / jpg_filename
-            cv2.imwrite(str(jpg_path), background)
+            # 保存PNG图片，命名格式：[策略名_5位0填充的帧号].png
+            png_filename = f"{name}_{idx:05d}.png"
+            png_path = png_dir / png_filename
+            cv2.imwrite(str(png_path), background)
 
         out_path = target_dir / f"{name}.gif"
         reference_curve = None
