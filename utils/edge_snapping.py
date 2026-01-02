@@ -61,8 +61,6 @@ def compute_all_candidates(images_rgb_nhwc_uint8: np.ndarray):
 class EdgeSnappingConfig:
     theta = None
     alpha = None
-    beta = None
-    beta_shift = None
     sigma_c = None
     sigma_s = None
     sigma_m = None
@@ -70,8 +68,6 @@ class EdgeSnappingConfig:
     X_MAX = None
     Y_MAX = None
     r_s = None
-    candidate_num = None
-    sampling_num = None
     average_weight_threshold = None
     lambda_shape = None  # 形状约束项的权重
     lambda_topology = None  # 拓扑顺序项的权重
@@ -96,8 +92,6 @@ class EdgeSnappingConfig:
 
         EdgeSnappingConfig.theta = s['theta']
         EdgeSnappingConfig.alpha = s['alpha']
-        EdgeSnappingConfig.beta = s['beta']
-        EdgeSnappingConfig.beta_shift = s['beta_shift']
         EdgeSnappingConfig.sigma_c = s['sigma_c']
         EdgeSnappingConfig.sigma_s = s['sigma_s']
         EdgeSnappingConfig.sigma_m = s['sigma_m']
@@ -105,8 +99,6 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.X_MAX = s['x']
         EdgeSnappingConfig.Y_MAX = s['y']
         EdgeSnappingConfig.r_s = s['r_s']
-        EdgeSnappingConfig.candidate_num = s['candidate_num']
-        EdgeSnappingConfig.sampling_num = s['sampling_num']
         EdgeSnappingConfig.average_weight_threshold = s['average_weight_threshold']
         EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.1)  # 默认值0.1
         EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.15)  # 默认值0.15

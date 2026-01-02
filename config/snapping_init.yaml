@@ -1,22 +1,29 @@
 snapping:
-  theta: 0.1
-  alpha: 0.1
-  beta: 0.5
-  beta_shift: 0.2
-  sigma_c: 1.0
-  sigma_s: 1.6
-  sigma_m: 3.0
-  rho: 0.99
-  x: 4
-  y: 7
-  r_s: 20
-  candidate_num: 4
-  sampling_num: 100
-  average_weight_threshold: 0.07
+  # ========== 边缘检测参数 ==========
+  theta: 0.1  # 边缘检测阈值，用于过滤局部最大值点（compute_all_candidates）
+  
+  # ========== FDoG滤波器参数 ==========
+  sigma_c: 1.0  # FDoG核中心高斯的标准差
+  sigma_s: 1.6  # FDoG核周围高斯的标准差
+  sigma_m: 3.0  # 沿v方向高斯平滑的标准差
+  rho: 0.99  # FDoG核的权重系数
+  x: 4  # FDoG核u方向（x方向）的最大范围，映射为X_MAX
+  y: 7  # 高斯核v方向（y方向）的最大范围，映射为Y_MAX
+  
+  # ========== 能量函数权重参数 ==========
+  alpha: 0.1  # FDoG响应项（tilde_H_response）的权重系数
+  lambda_deform: 1.0  # 形变项的权重，控制形变惩罚的强度
   lambda_shape: 0.0  # 形状约束项的权重（已禁用，仅保留核心算法）
   lambda_topology: 0.0  # 拓扑顺序项的权重（已禁用，仅保留核心算法）
-  lambda_deform: 1.0  # 形变项的权重（使用论文原始值）
   lambda_velocity: 0.0  # 速度约束项的权重（已禁用，仅保留核心算法）
   lambda_length: 0.0  # 长度约束项的权重（已禁用，仅保留核心算法）
-  erode_size: 2
-  dilate_size: 2
+  
+  # ========== 候选点搜索参数 ==========
+  r_s: 20  # 候选点搜索半径，用于KD树查询和形变项归一化
+  
+  # ========== 路径选择参数 ==========
+  average_weight_threshold: 0.07  # 平均能量阈值，用于pick_best_path判断路径是否可接受
+  
+  # ========== Mask过滤参数 ==========
+  erode_size: 2  # Mask腐蚀的核大小（像素），用于过滤物体内部的候选点
+  dilate_size: 2  # Mask膨胀的核大小（像素），用于过滤物体外部的候选点
