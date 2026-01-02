@@ -69,11 +69,11 @@ class EdgeSnappingConfig:
     Y_MAX = None
     r_s = None
     average_weight_threshold = None
-    lambda_shape = None  # 形状约束项的权重
-    lambda_topology = None  # 拓扑顺序项的权重
+    # lambda_shape = None  # 形状约束项的权重（已禁用）
+    # lambda_topology = None  # 拓扑顺序项的权重（已禁用）
     lambda_deform = None  # 形变项的权重（用于增强形变控制）
-    lambda_velocity = None  # 速度项的权重（防止过大的位移）
-    lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）
+    # lambda_velocity = None  # 速度项的权重（防止过大的位移）（已禁用）
+    # lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）（已禁用）
     erode_size = None
     dilate_size = None
 
@@ -100,11 +100,11 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.Y_MAX = s['y']
         EdgeSnappingConfig.r_s = s['r_s']
         EdgeSnappingConfig.average_weight_threshold = s['average_weight_threshold']
-        EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.1)  # 默认值0.1
-        EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.15)  # 默认值0.15
+        # EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.1)  # 默认值0.1（已禁用）
+        # EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.15)  # 默认值0.15（已禁用）
         EdgeSnappingConfig.lambda_deform = s.get('lambda_deform', 1.0)  # 默认值1.0
-        EdgeSnappingConfig.lambda_velocity = s.get('lambda_velocity', 0.5)  # 默认值0.5（强化后的默认值）
-        EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2
+        # EdgeSnappingConfig.lambda_velocity = s.get('lambda_velocity', 0.5)  # 默认值0.5（已禁用）
+        # EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2（已禁用）
         EdgeSnappingConfig.erode_size = s['erode_size']
         EdgeSnappingConfig.dilate_size = s['dilate_size']
 
@@ -894,37 +894,37 @@ def compute_weights(H: int, W: int,
     deform_weight = EdgeSnappingConfig.lambda_deform if EdgeSnappingConfig.lambda_deform is not None else 1.0
     weights = deform_weight * deform_term + EdgeSnappingConfig.alpha * tilde_H_response
     
-    # 形状约束项（Shape Constraint Term）
+    # 形状约束项（Shape Constraint Term）- 已禁用
     # 约束相邻点之间的距离和角度，保持笔画的形状一致性
-    if EdgeSnappingConfig.lambda_shape > 0:
-        shape_term = compute_shape_constraint_term(
-            p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
-        )
-        weights = weights + EdgeSnappingConfig.lambda_shape * shape_term
+    # if EdgeSnappingConfig.lambda_shape > 0:
+    #     shape_term = compute_shape_constraint_term(
+    #         p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
+    #     )
+    #     weights = weights + EdgeSnappingConfig.lambda_shape * shape_term
     
-    # 拓扑顺序项（Topology Term）
+    # 拓扑顺序项（Topology Term）- 已禁用
     # 约束点的顺序，避免交叉和方向反转
-    if EdgeSnappingConfig.lambda_topology > 0:
-        topology_term = compute_topology_term(
-            p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
-        )
-        weights = weights + EdgeSnappingConfig.lambda_topology * topology_term
+    # if EdgeSnappingConfig.lambda_topology > 0:
+    #     topology_term = compute_topology_term(
+    #         p_i, p_j, Q_i, Q_j, prev_q_i, r_s_square
+    #     )
+    #     weights = weights + EdgeSnappingConfig.lambda_topology * topology_term
 
-    # 速度约束项（Velocity Term，强化版）
+    # 速度约束项（Velocity Term，强化版）- 已禁用
     # 防止相邻帧之间过大的位移，保持时间连续性
-    if EdgeSnappingConfig.lambda_velocity > 0 and prev_p_i is not None and prev_p_j is not None:
-        velocity_term = compute_velocity_term(
-            prev_p_i, prev_p_j, Q_i, Q_j, r_s_square
-        )
-        weights = weights + EdgeSnappingConfig.lambda_velocity * velocity_term
+    # if EdgeSnappingConfig.lambda_velocity > 0 and prev_p_i is not None and prev_p_j is not None:
+    #     velocity_term = compute_velocity_term(
+    #         prev_p_i, prev_p_j, Q_i, Q_j, r_s_square
+    #     )
+    #     weights = weights + EdgeSnappingConfig.lambda_velocity * velocity_term
 
-    # 长度约束项（Length Term）
+    # 长度约束项（Length Term）- 已禁用
     # 控制整体polyline长度的变化，保持长度稳定性
-    if EdgeSnappingConfig.lambda_length > 0 and stroke_total_length is not None and stroke_total_length > 1e-6:
-        length_term = compute_length_term(
-            p_i, p_j, Q_i, Q_j, stroke_total_length, prev_stroke_total_length, r_s_square
-        )
-        weights = weights + EdgeSnappingConfig.lambda_length * length_term
+    # if EdgeSnappingConfig.lambda_length > 0 and stroke_total_length is not None and stroke_total_length > 1e-6:
+    #     length_term = compute_length_term(
+    #         p_i, p_j, Q_i, Q_j, stroke_total_length, prev_stroke_total_length, r_s_square
+    #     )
+    #     weights = weights + EdgeSnappingConfig.lambda_length * length_term
 
     # print(f"p_diff.shape = {p_diff.shape}")
     # print(f"q_diff.shape = {q_diff.shape}")
