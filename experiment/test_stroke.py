@@ -380,6 +380,148 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
 
+def generate_snapping_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+) -> np.ndarray:
+    """
+    生成当前帧的snapping预测结果。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的fitted stroke
+        buffers: 存储预测结果的缓冲区
+        data: 包含图像和KD树的数据
+    
+    Returns:
+        当前帧的snapping预测结果
+    """
+    # 使用未过滤的候选点进行纯吸附传播
+    points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
+        i_frame,
+        stroke_copied,
+        EdgeSnappingConfig.r_s,
+    )
+
+    if i == 0 or buffers.snapping[i_frame - 1] is None:
+        previous_snapping = stroke_copied
+        previous_snapped_stroke = None  # 第一帧没有前一帧
+    else:
+        previous_snapping = buffers.snapping[i_frame - 1]
+        previous_snapped_stroke = buffers.snapping[i_frame - 1]  # 用于速度约束
+    
+    stroke_snapping = local_snapping(
+        previous_snapping,
+        data.images_rgb[i_frame],
+        points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
+        previous_snapped_stroke=previous_snapped_stroke,
+        original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+    )
+    
+    return stroke_snapping
+
+
+def generate_flow_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    生成当前帧的flow预测结果。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的fitted stroke
+        buffers: 存储预测结果的缓冲区
+        data: 包含光流数据的数据
+        H: 图像高度
+        W: 图像宽度
+    
+    Returns:
+        当前帧的flow预测结果
+    """
+    # 光流传播：从 frame i-1 到 frame i
+    # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
+    # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
+
+    if i == 0 or buffers.flow[i_frame - 1] is None:
+        x, y = stroke_copied[:, 0], stroke_copied[:, 1]
+        previous_flow = stroke_copied
+    else:
+        previous_flow = buffers.flow[i_frame - 1]
+        x, y = previous_flow[:, 0], previous_flow[:, 1]
+
+    # 边界检查：确保索引在有效范围内
+    x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
+    y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
+    flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
+    stroke_flow = previous_flow + flow_vectors
+    
+    return stroke_flow
+
+
+def generate_fitted_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    生成当前帧的fitted预测结果。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的fitted stroke
+        buffers: 存储预测结果的缓冲区
+        data: 包含图像、光流和KD树的数据
+        H: 图像高度
+        W: 图像宽度
+    
+    Returns:
+        当前帧的fitted预测结果
+    """
+    # fitted 传播：使用当前帧的 fitted stroke 位置采样光流
+    x_fit, y_fit = stroke_copied[:, 0], stroke_copied[:, 1]
+    x_fit_clipped = np.clip(x_fit.astype(np.int32), 0, W - 1)
+    y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
+    flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
+    stroke_fitted = stroke_copied + flow_vectors_fit
+
+    # 使用过滤后的候选点进行fitted传播
+    points_stroke_candidate_fitted = data.kd_tree.query_batch(
+        i_frame,
+        stroke_fitted,
+        EdgeSnappingConfig.r_s,
+    )
+    # 获取前一帧的fitted结果用于速度约束
+    previous_fitted_stroke = None
+    if i > 0 and buffers.fitted[i_frame - 1] is not None:
+        previous_fitted_stroke = buffers.fitted[i_frame - 1]
+    
+    stroke_fitted = local_snapping(
+        stroke_fitted,
+        data.images_rgb[i_frame],
+        points_stroke_candidate_fitted,  # 使用过滤后的候选点
+        previous_snapped_stroke=previous_fitted_stroke,
+        original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+    )
+    
+    return stroke_fitted
+
+
 def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeData) -> None:
     """Iteratively propagate strokes across frames using flow & snapping."""
 
@@ -395,25 +537,9 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
         if stroke_copied is None:
             raise RuntimeError(f"Missing fitted stroke for frame {i_frame - 1}")
 
-        # 使用未过滤的候选点进行纯吸附传播
-        points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
-            i_frame,
-            stroke_copied,
-            EdgeSnappingConfig.r_s,
-        )
-
-        if i == 0 or buffers.snapping[i_frame - 1] is None:
-            previous_snapping = stroke_copied
-            previous_snapped_stroke = None  # 第一帧没有前一帧
-        else:
-            previous_snapping = buffers.snapping[i_frame - 1]
-            previous_snapped_stroke = buffers.snapping[i_frame - 1]  # 用于速度约束
-        stroke_snapping = local_snapping(
-            previous_snapping,
-            data.images_rgb[i_frame],
-            points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
-            previous_snapped_stroke=previous_snapped_stroke,
-            original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+        # 生成snapping预测结果
+        stroke_snapping = generate_snapping_prediction(
+            i_frame, i, stroke_copied, buffers, data
         )
         buffers.snapping[i_frame] = stroke_snapping
 
@@ -425,61 +551,15 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             if i_frame % 10 == 0:
                 torch.cuda.reset_peak_memory_stats()
 
-        # 光流传播：从 frame i-1 到 frame i
-        # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
-        # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
-
-        if i == 0 or buffers.flow[i_frame - 1] is None:
-            x, y = stroke_copied[:, 0], stroke_copied[:, 1]
-            previous_flow = stroke_copied
-        else:
-            previous_flow = buffers.flow[i_frame - 1]
-            x, y = previous_flow[:, 0], previous_flow[:, 1]
-
-        # 边界检查：确保索引在有效范围内
-        x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
-        y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
-        flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
-        stroke_flow = previous_flow + flow_vectors
+        # 生成flow预测结果
+        stroke_flow = generate_flow_prediction(
+            i_frame, i, stroke_copied, buffers, data, H, W
+        )
         buffers.flow[i_frame] = stroke_flow
 
-        # fitted 传播：使用当前帧的 fitted stroke 位置采样光流
-        x_fit, y_fit = stroke_copied[:, 0], stroke_copied[:, 1]
-        x_fit_clipped = np.clip(x_fit.astype(np.int32), 0, W - 1)
-        y_fit_clipped = np.clip(y_fit.astype(np.int32), 0, H - 1)
-        flow_vectors_fit = data.flow_nhw2[i_frame - 1, y_fit_clipped, x_fit_clipped]  # [N, 2]
-        stroke_fitted = stroke_copied + flow_vectors_fit
-
-        # 光流传播后立即进行长度归一化，防止长度变化累积（已禁用，仅保留核心算法）
-        # 使用向量化计算，避免循环
-        # if data.original_stroke_length is not None and data.original_stroke_length > 1e-6:
-        #     # 计算光流传播后的长度（向量化）
-        #     stroke_diffs = stroke_fitted[1:] - stroke_fitted[:-1]
-        #     flow_length = np.sum(np.linalg.norm(stroke_diffs, axis=1))
-        #     
-        #     # 如果长度变化超过3%，立即归一化
-        #     if flow_length > 1e-6 and abs(flow_length - data.original_stroke_length) / data.original_stroke_length > 0.03:
-        #         scale_factor = data.original_stroke_length / flow_length
-        #         # 以第一个点为基准进行缩放（向量化）
-        #         center = stroke_fitted[0]
-        #         stroke_fitted = center + (stroke_fitted - center) * scale_factor
-
-        # 使用过滤后的候选点进行fitted传播
-        points_stroke_candidate_fitted = data.kd_tree.query_batch(
-            i_frame,
-            stroke_fitted,
-            EdgeSnappingConfig.r_s,
-        )
-        # 获取前一帧的fitted结果用于速度约束
-        previous_fitted_stroke = None
-        if i > 0 and buffers.fitted[i_frame - 1] is not None:
-            previous_fitted_stroke = buffers.fitted[i_frame - 1]
-        stroke_fitted = local_snapping(
-            stroke_fitted,
-            data.images_rgb[i_frame],
-            points_stroke_candidate_fitted,  # 使用过滤后的候选点
-            previous_snapped_stroke=previous_fitted_stroke,
-            original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+        # 生成fitted预测结果
+        stroke_fitted = generate_fitted_prediction(
+            i_frame, i, stroke_copied, buffers, data, H, W
         )
         buffers.fitted[i_frame] = stroke_fitted
 
