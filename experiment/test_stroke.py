@@ -51,9 +51,15 @@ class StrokeEnvironment:
 
     @property
     def cache_file(self) -> Path:
-        """Path to the optical-flow cache tensor for the current target."""
+        """Path to the optical-flow cache tensor for the current target (dilated flow, used for fitted)."""
 
         return self.paths.cache / "flow-dilate" / f"{self.target_name}.pt"
+
+    @property
+    def flow_cache_file_unfiltered(self) -> Path:
+        """Path to the unfiltered optical-flow cache tensor for the current target (used for flow and flow_snapped)."""
+
+        return self.paths.cache / "flow" / f"{self.target_name}.pt"
 
     @property
     def mask_cache_file(self) -> Path:
@@ -110,7 +116,8 @@ class StrokeData:
     """In-memory data required to propagate strokes over all frames."""
 
     images_rgb: np.ndarray
-    flow_nhw2: np.ndarray
+    flow_nhw2: np.ndarray  # 膨胀后的光流（用于fitted）
+    flow_nhw2_unfiltered: np.ndarray  # 未膨胀的光流（用于flow和flow_snapped）
     kd_tree: BatchKDTree  # 使用过滤后的候选点
     kd_tree_unfiltered: BatchKDTree = None  # 使用未过滤的候选点（用于纯光流和纯吸附）
     original_stroke_length: float = None  # 第一帧原始stroke的长度（用于长度约束）
@@ -221,12 +228,21 @@ def read_images_batch(paths: List[Path], flag: Any) -> np.ndarray:
 
 
 def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
-    """Load the precomputed optical-flow tensor for the configured target."""
+    """Load the precomputed optical-flow tensor for the configured target (dilated flow)."""
 
     cache_path = env.cache_file
     if cache_path.exists():
         return torch.load(str(cache_path))
     raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
+
+
+def read_optical_flow_cache_unfiltered(env: StrokeEnvironment) -> Tensor:
+    """Load the unfiltered optical-flow tensor for the configured target (unfiltered flow)."""
+
+    cache_path = env.flow_cache_file_unfiltered
+    if cache_path.exists():
+        return torch.load(str(cache_path))
+    raise ValueError(f"Unfiltered optical flow cache file does not exist: {cache_path}")
 
 
 def read_mask_cache(env: StrokeEnvironment) -> np.ndarray:
@@ -399,8 +415,8 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     )
     buffers.snapping[0] = stroke_0_snapping.astype(np.float32)
 
-    # 生成flow结果（第0帧没有光流，所以直接使用fitted结果）
-    buffers.flow[0] = stroke_0_snapped.astype(np.float32)
+    # 生成flow结果（第0帧使用未过滤点集吸附）
+    buffers.flow[0] = stroke_0_snapping.astype(np.float32)
 
     # 生成flow_snapped结果（第0帧使用未过滤点集的吸附结果）
     buffers.flow_snapped[0] = stroke_0_snapping.astype(np.float32)
@@ -487,14 +503,14 @@ def generate_flow_prediction(
         raise RuntimeError(f"Missing flow stroke for frame {i_frame - 1}")
 
     # 光流传播：从 frame i-1 到 frame i
-    # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
+    # flow_nhw2_unfiltered[i_frame - 1] 存储的是从 frame i-1 到 frame i 的未膨胀光流
     # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
     x, y = previous_flow[:, 0], previous_flow[:, 1]
 
     # 边界检查：确保索引在有效范围内
     x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
     y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
-    flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
+    flow_vectors = data.flow_nhw2_unfiltered[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
     stroke_flow = previous_flow + flow_vectors
     
     return stroke_flow
@@ -532,14 +548,14 @@ def generate_flow_snapped_prediction(
     if previous_flow_snapped is None:
         raise RuntimeError(f"Missing flow_snapped stroke for frame {i_frame - 1}")
 
-    # 第一步：光流传播
-    # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
+    # 第一步：光流传播（使用未膨胀的光流）
+    # flow_nhw2_unfiltered[i_frame - 1] 存储的是从 frame i-1 到 frame i 的未膨胀光流
     x, y = previous_flow_snapped[:, 0], previous_flow_snapped[:, 1]
 
     # 边界检查：确保索引在有效范围内
     x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
     y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
-    flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
+    flow_vectors = data.flow_nhw2_unfiltered[i_frame - 1, y_clipped, x_clipped]  # [N, 2] 格式：[dx, dy]
     stroke_after_flow = previous_flow_snapped + flow_vectors
 
     # 第二步：使用未过滤的候选点进行吸附
@@ -810,7 +826,11 @@ def build_runtime_context() -> RuntimeContext:
 
     flow_tensor = read_optical_flow_cache(env)
     flow_nhw2_float32 = flow_tensor.numpy()
-    print(f"Loaded optical flow cache: {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
+    print(f"Loaded optical flow cache (dilated): {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
+
+    flow_tensor_unfiltered = read_optical_flow_cache_unfiltered(env)
+    flow_nhw2_unfiltered_float32 = flow_tensor_unfiltered.numpy()
+    print(f"Loaded optical flow cache (unfiltered): {flow_nhw2_unfiltered_float32.shape}, {flow_nhw2_unfiltered_float32.dtype}")
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
 
@@ -866,7 +886,8 @@ def build_runtime_context() -> RuntimeContext:
 
     data = StrokeData(
         images_rgb=images_rgb_nhwc_uint8,
-        flow_nhw2=flow_nhw2_float32,
+        flow_nhw2=flow_nhw2_float32,  # 膨胀后的光流（用于fitted）
+        flow_nhw2_unfiltered=flow_nhw2_unfiltered_float32,  # 未膨胀的光流（用于flow和flow_snapped）
         kd_tree=kd_tree_groups,
         kd_tree_unfiltered=kd_tree_groups_unfiltered,
     )
