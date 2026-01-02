@@ -365,6 +365,7 @@ def rgb_to_bgr(color: tuple) -> tuple:
 def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, stroke_0: np.ndarray) -> None:
     """Snap the reference stroke onto frame-0 edges prior to propagation."""
 
+    # 生成fitted结果（使用过滤后的候选点）
     points_stroke_candidate = data.kd_tree.query_batch(
         0,
         stroke_0,
@@ -379,6 +380,24 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     )
     buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
+    # 生成snapping结果（使用未过滤的候选点）
+    points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
+        0,
+        stroke_0,
+        EdgeSnappingConfig.r_s,
+    )
+    stroke_0_snapping = local_snapping(
+        stroke_0,
+        data.images_rgb[0],
+        points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
+        previous_snapped_stroke=None,  # 第一帧没有前一帧
+        original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
+    )
+    buffers.snapping[0] = stroke_0_snapping.astype(np.float32)
+
+    # 生成flow结果（第0帧没有光流，所以直接使用fitted结果）
+    buffers.flow[0] = stroke_0_snapped.astype(np.float32)
+
 
 def generate_snapping_prediction(
     i_frame: int,
@@ -389,30 +408,34 @@ def generate_snapping_prediction(
 ) -> np.ndarray:
     """
     生成当前帧的snapping预测结果。
+    使用自身的数据进行传播，如果是第一帧则使用第0帧的结果。
     
     Args:
         i_frame: 当前帧索引
         i: 循环索引（用于判断是否是第一帧）
-        stroke_copied: 从前一帧复制的fitted stroke
+        stroke_copied: 从前一帧复制的fitted stroke（仅用于查询候选点）
         buffers: 存储预测结果的缓冲区
         data: 包含图像和KD树的数据
     
     Returns:
         当前帧的snapping预测结果
     """
+    # 使用自身的数据进行传播
+    # 如果是第一帧（i_frame=1），使用第0帧的snapping结果
+    previous_snapping = buffers.snapping[i_frame - 1]
+    if previous_snapping is None:
+        raise RuntimeError(f"Missing snapping stroke for frame {i_frame - 1}")
+
     # 使用未过滤的候选点进行纯吸附传播
+    # 使用前一帧的snapping位置查询候选点
     points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
         i_frame,
-        stroke_copied,
+        previous_snapping,
         EdgeSnappingConfig.r_s,
     )
 
-    if i == 0 or buffers.snapping[i_frame - 1] is None:
-        previous_snapping = stroke_copied
-        previous_snapped_stroke = None  # 第一帧没有前一帧
-    else:
-        previous_snapping = buffers.snapping[i_frame - 1]
-        previous_snapped_stroke = buffers.snapping[i_frame - 1]  # 用于速度约束
+    # 获取前一帧的snapping结果用于速度约束
+    previous_snapped_stroke = buffers.snapping[i_frame - 1] if i > 0 else None
     
     stroke_snapping = local_snapping(
         previous_snapping,
@@ -436,11 +459,12 @@ def generate_flow_prediction(
 ) -> np.ndarray:
     """
     生成当前帧的flow预测结果。
+    使用自身的数据进行传播，如果是第一帧则使用第0帧的结果。
     
     Args:
         i_frame: 当前帧索引
         i: 循环索引（用于判断是否是第一帧）
-        stroke_copied: 从前一帧复制的fitted stroke
+        stroke_copied: 从前一帧复制的fitted stroke（未使用，保留以保持接口一致）
         buffers: 存储预测结果的缓冲区
         data: 包含光流数据的数据
         H: 图像高度
@@ -449,16 +473,16 @@ def generate_flow_prediction(
     Returns:
         当前帧的flow预测结果
     """
+    # 使用自身的数据进行传播
+    # 如果是第一帧（i_frame=1），使用第0帧的flow结果
+    previous_flow = buffers.flow[i_frame - 1]
+    if previous_flow is None:
+        raise RuntimeError(f"Missing flow stroke for frame {i_frame - 1}")
+
     # 光流传播：从 frame i-1 到 frame i
     # flow_nhw2[i_frame - 1] 存储的是从 frame i-1 到 frame i 的光流
     # 格式：[H, W, 2]，其中 [:, :, 0] 是 x 方向，[:, :, 1] 是 y 方向
-
-    if i == 0 or buffers.flow[i_frame - 1] is None:
-        x, y = stroke_copied[:, 0], stroke_copied[:, 1]
-        previous_flow = stroke_copied
-    else:
-        previous_flow = buffers.flow[i_frame - 1]
-        x, y = previous_flow[:, 0], previous_flow[:, 1]
+    x, y = previous_flow[:, 0], previous_flow[:, 1]
 
     # 边界检查：确保索引在有效范围内
     x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
@@ -583,9 +607,7 @@ def propagate_strokes_with_snapping_flow(data: StrokeData, buffers: StrokeBuffer
 
     n_frame = data.images_rgb.shape[0]
     buffers.reset(n_frame)
-    buffers.flow[0] = None
-    buffers.snapping[0] = None
-    buffers.fitted[0] = None
+    # 注意：第0帧的flow、snapping和fitted会在generate_prediction_stroke_on_0中初始化
 
     # 计算第一帧原始stroke的长度（用于长度约束）
     if data.original_stroke_length is None:
