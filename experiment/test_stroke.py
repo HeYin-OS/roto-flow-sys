@@ -758,7 +758,7 @@ def propagate_current_stroke(context: RuntimeContext) -> None:
 
 
 def export_stroke_gifs(context: RuntimeContext) -> None:
-    """Export stroke propagation results to GIFs grouped by stroke categories."""
+    """Export stroke propagation results to GIFs and JPG images grouped by stroke categories."""
 
     env = context.env
     data = context.data
@@ -776,8 +776,12 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
 
     for name, strokes, color_rgb in stroke_categories:
         frames_bgr: List[np.ndarray] = []
+        
+        # 创建该策略的JPG图片目录
+        jpg_dir = target_dir / name
+        jpg_dir.mkdir(parents=True, exist_ok=True)
 
-        for idx in tqdm(range(n_frame), desc=f"Building {name} GIF", unit=" frame(s)"):
+        for idx in tqdm(range(n_frame), desc=f"Building {name} GIF and JPGs", unit=" frame(s)"):
             background = cv2.cvtColor(data.images_rgb[idx], cv2.COLOR_RGB2BGR)
             stroke_data = strokes[idx]
             if stroke_data is not None:
@@ -790,6 +794,11 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
                     lineType=cv2.LINE_AA,
                 )
             frames_bgr.append(background)
+            
+            # 保存JPG图片，命名格式：[策略名_5位0填充的帧号].jpg
+            jpg_filename = f"{name}_{idx:05d}.jpg"
+            jpg_path = jpg_dir / jpg_filename
+            cv2.imwrite(str(jpg_path), background)
 
         out_path = target_dir / f"{name}.gif"
         reference_curve = None
