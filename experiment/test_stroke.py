@@ -859,6 +859,18 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
                 if file_path.is_file():
                     file_path.unlink()
 
+        # 获取图像尺寸和裁剪参数
+        H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
+        crop_ratio = EdgeSnappingConfig.export_crop_ratio if EdgeSnappingConfig.export_crop_ratio is not None else 1.0
+        
+        # 计算裁剪区域（从中心开始）
+        crop_h = int(H * crop_ratio)
+        crop_w = int(W * crop_ratio)
+        start_y = (H - crop_h) // 2
+        start_x = (W - crop_w) // 2
+        end_y = start_y + crop_h
+        end_x = start_x + crop_w
+
         for idx in tqdm(range(n_frame), desc=f"Building {name} GIF and PNGs", unit=" frame(s)"):
             background = cv2.cvtColor(data.images_rgb[idx], cv2.COLOR_RGB2BGR)
             stroke_data = strokes[idx]
@@ -874,9 +886,11 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
             frames_bgr.append(background)
             
             # 保存PNG图片，命名格式：[策略名_5位0填充的帧号].png
+            # 从中心裁剪0.5H*0.5W的区域
+            png_image = background[start_y:end_y, start_x:end_x]
             png_filename = f"{name}_{idx:05d}.png"
             png_path = png_dir / png_filename
-            cv2.imwrite(str(png_path), background)
+            cv2.imwrite(str(png_path), png_image)
 
         out_path = target_dir / f"{name}.gif"
         reference_curve = None
