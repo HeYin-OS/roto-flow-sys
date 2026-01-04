@@ -38,7 +38,7 @@ def main():
         for i in range(len(curve) - 1):
             cv2.line(canvas, curve[i], curve[i + 1], (251, 250, 129), 2, lineType=cv2.LINE_AA)
 
-    cv2.imshow(target_name, canvas)
+    cv2.imshow(f"Examine strokes: {target_name}", canvas)
     cv2.waitKey(0)
 
 
