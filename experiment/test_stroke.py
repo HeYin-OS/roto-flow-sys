@@ -839,6 +839,39 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     target_dir = env.paths.result / "final" / env.target_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    # 生成 input.png（第 0 帧的原始 stroke）
+    H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
+    crop_ratio = EdgeSnappingConfig.export_crop_ratio if EdgeSnappingConfig.export_crop_ratio is not None else 1.0
+    
+    # 计算裁剪区域（从中心开始）
+    crop_h = int(H * crop_ratio)
+    crop_w = int(W * crop_ratio)
+    start_y = (H - crop_h) // 2
+    start_x = (W - crop_w) // 2
+    end_y = start_y + crop_h
+    end_x = start_x + crop_w
+    
+    # 生成第 0 帧的原始 stroke 图像
+    background_input = cv2.cvtColor(data.images_rgb[0], cv2.COLOR_RGB2BGR)
+    stroke_origin = context.strokes_library[context.viewer.current_stroke_index]
+    cv2.polylines(
+        background_input,
+        [stroke_origin.astype(np.int32)],
+        False,
+        rgb_to_bgr(COLOR_ORIGIN),
+        THICKNESS,
+        lineType=cv2.LINE_AA,
+    )
+    
+    # 保存不剪裁版本
+    input_path_full = target_dir / "input.png"
+    cv2.imwrite(str(input_path_full), background_input)
+    
+    # 保存剪裁版本
+    input_image_cropped = background_input[start_y:end_y, start_x:end_x]
+    input_path_cropped = target_dir / "input_cropped.png"
+    cv2.imwrite(str(input_path_cropped), input_image_cropped)
+
     stroke_categories = (
         ("fitted", buffers.fitted, COLOR_FITTED),
         ("flow", buffers.flow, COLOR_FLOW),
@@ -859,18 +892,6 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
                 if file_path.is_file():
                     file_path.unlink()
 
-        # 获取图像尺寸和裁剪参数
-        H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
-        crop_ratio = EdgeSnappingConfig.export_crop_ratio if EdgeSnappingConfig.export_crop_ratio is not None else 1.0
-        
-        # 计算裁剪区域（从中心开始）
-        crop_h = int(H * crop_ratio)
-        crop_w = int(W * crop_ratio)
-        start_y = (H - crop_h) // 2
-        start_x = (W - crop_w) // 2
-        end_y = start_y + crop_h
-        end_x = start_x + crop_w
-
         for idx in tqdm(range(n_frame), desc=f"Building {name} GIF and PNGs", unit=" frame(s)"):
             background = cv2.cvtColor(data.images_rgb[idx], cv2.COLOR_RGB2BGR)
             stroke_data = strokes[idx]
@@ -886,12 +907,13 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
             frames_bgr.append(background)
             
             # 保存PNG图片，命名格式：[策略名_5位0填充的帧号].png
-            # 从中心裁剪0.5H*0.5W的区域
+            # 从中心裁剪的区域
             png_image = background[start_y:end_y, start_x:end_x]
             png_filename = f"{name}_{idx:05d}.png"
             png_path = png_dir / png_filename
             cv2.imwrite(str(png_path), png_image)
 
+        # GIF 输出改为不剪裁（使用完整的 frames_bgr）
         out_path = target_dir / f"{name}.gif"
         reference_curve = None
         if name == "fitted" and strokes[0] is not None:
