@@ -215,18 +215,18 @@ class MaskExtractor:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--text_prompt", type=str, default="bear")
-    parser.add_argument("--target_name", type=str, default=None)
     parser.add_argument("--no_cache", action="store_true")
     args = parser.parse_args()
 
+    # 从配置文件获取 frame_dir，并通过最后一层文件夹名自动获取目标名
     base, _, _, frame_dir, _, _ = build_project_paths()
-    target_name = args.target_name or get_target_name(frame_dir)
+    target_name = get_target_name(frame_dir)
     frame_paths = sorted([p for p in frame_dir.iterdir() if p.suffix.lower() in (".jpg", ".png")])
     if not frame_paths: raise ValueError("无图片")
 
-    print(f"🎯 目标: {args.text_prompt}")
+    print(f"🎯 目标: {target_name}")
     box_extractor = FlorenceBoxExtractor()
-    boxes = box_extractor.extract_boxes(Image.open(frame_paths[0]).convert("RGB"), args.text_prompt)
+    boxes = box_extractor.extract_boxes(Image.open(frame_paths[0]).convert("RGB"), target_name)
     if not boxes: raise ValueError("未找到目标Box")
     
     # --- 修正点：收紧 Box Padding ---
