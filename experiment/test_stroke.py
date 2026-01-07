@@ -914,6 +914,7 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
             cv2.imwrite(str(png_path), png_image)
 
         # GIF 输出改为不剪裁（使用完整的 frames_bgr）
+        # 传入足够大的 crop_size 来禁用裁剪（传入大于图像尺寸的值，函数内部会限制为图像尺寸）
         out_path = target_dir / f"{name}.gif"
         reference_curve = None
         if name == "fitted" and strokes[0] is not None:
@@ -925,6 +926,7 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
             loop=0,
             optimize=True,
             reference_curve=reference_curve,
+            crop_size=(H * 2, W * 2),  # 传入足够大的值以确保不裁剪（函数内部会限制为图像尺寸）
         )
 
 
