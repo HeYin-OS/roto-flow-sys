@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import List
 
 import cv2
@@ -6,10 +7,14 @@ import numpy as np
 
 from utils.yaml_reader import YamlUtil
 
-path_head = YamlUtil.read("../config/test_video_init.yaml")['video']['url_head']
+# 获取项目根目录（脚本的父目录的父目录）
+project_root = Path(__file__).parent.parent
+config_path = project_root / "config" / "test_video_init.yaml"
+
+path_head = YamlUtil.read(str(config_path))['video']['url_head']
 target_name = path_head.split('/')[-1]
-frame_0_url = "." + YamlUtil.read("../config/test_video_init.yaml")['video']['url_head'] + "/00000.jpg"
-stroke_save_folder_path = "../stroke/" + target_name + "/"
+frame_0_url = str(project_root) + YamlUtil.read(str(config_path))['video']['url_head'] + "/00000.jpg"
+stroke_save_folder_path = str(project_root / "stroke" / target_name) + "/"
 
 print(f"image path: {frame_0_url}")
 

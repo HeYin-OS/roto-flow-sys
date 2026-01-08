@@ -72,11 +72,16 @@ class EdgeSnappingConfig:
     # lambda_shape = None  # 形状约束项的权重（已禁用）
     # lambda_topology = None  # 拓扑顺序项的权重（已禁用）
     lambda_deform = None  # 形变项的权重（用于增强形变控制）
+    lambda_crossing = None  # 交叉惩罚项的权重（在吸附阶段避免交叉）
     # lambda_velocity = None  # 速度项的权重（防止过大的位移）（已禁用）
     # lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）（已禁用）
     erode_size = None
     dilate_size = None
     flow_erode_size = None  # 光流截取时Mask腐蚀的核大小
+    enable_topology_fix = None  # 是否启用拓扑检查和修复
+    topology_fix_max_iterations = None  # 拓扑修复的最大迭代次数
+    topology_fix_smoothing = None  # 拓扑修复的平滑强度
+    max_stroke_points = None  # stroke的最大点数限制
     export_crop_ratio = None  # PNG导出时的裁剪比例
 
     fdog_kernel = None
@@ -105,11 +110,16 @@ class EdgeSnappingConfig:
         # EdgeSnappingConfig.lambda_shape = s.get('lambda_shape', 0.1)  # 默认值0.1（已禁用）
         # EdgeSnappingConfig.lambda_topology = s.get('lambda_topology', 0.15)  # 默认值0.15（已禁用）
         EdgeSnappingConfig.lambda_deform = s.get('lambda_deform', 1.0)  # 默认值1.0
+        EdgeSnappingConfig.lambda_crossing = s.get('lambda_crossing', 0.0)  # 默认值0.0（禁用）
         # EdgeSnappingConfig.lambda_velocity = s.get('lambda_velocity', 0.5)  # 默认值0.5（已禁用）
         # EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2（已禁用）
         EdgeSnappingConfig.erode_size = s['erode_size']
         EdgeSnappingConfig.dilate_size = s['dilate_size']
         EdgeSnappingConfig.flow_erode_size = s.get('flow_erode_size', s['erode_size'])  # 默认使用erode_size
+        EdgeSnappingConfig.enable_topology_fix = s.get('enable_topology_fix', True)  # 默认启用拓扑修复
+        EdgeSnappingConfig.topology_fix_max_iterations = s.get('topology_fix_max_iterations', 50)  # 默认50次迭代
+        EdgeSnappingConfig.topology_fix_smoothing = s.get('topology_fix_smoothing', 0.3)  # 默认平滑系数0.3
+        EdgeSnappingConfig.max_stroke_points = s.get('max_stroke_points', 200)  # 默认最大200点
         EdgeSnappingConfig.export_crop_ratio = s.get('export_crop_ratio', 1.0)  # 默认值1.0（不裁剪）
 
         EdgeSnappingConfig.isConfigInit = True
@@ -153,13 +163,13 @@ def local_snapping(stroke: np.ndarray,
 
     # 关键修复：如果传入的stroke点数已经超过限制，直接降采样
     # 防止点数累积导致性能下降
-    MAX_STROKE_POINTS = 200
-    if len(stroke) > MAX_STROKE_POINTS:
-        indices = np.linspace(0, len(stroke) - 1, MAX_STROKE_POINTS, dtype=np.int32)
-        stroke = stroke[indices]
-        if len(points_stroke_candidate) > MAX_STROKE_POINTS:
-            # 同时调整候选点列表的长度
-            points_stroke_candidate = points_stroke_candidate[:MAX_STROKE_POINTS]
+    # MAX_STROKE_POINTS = EdgeSnappingConfig.max_stroke_points
+    # if len(stroke) > MAX_STROKE_POINTS:
+    #     indices = np.linspace(0, len(stroke) - 1, MAX_STROKE_POINTS, dtype=np.int32)
+    #     stroke = stroke[indices]
+    #     if len(points_stroke_candidate) > MAX_STROKE_POINTS:
+    #         # 同时调整候选点列表的长度
+    #         points_stroke_candidate = points_stroke_candidate[:MAX_STROKE_POINTS]
     
     # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
     H = image_rgb_hwc.shape[0]
@@ -269,8 +279,9 @@ def local_snapping(stroke: np.ndarray,
     #         center = snapped_stroke[0]
     #         snapped_stroke = center + (snapped_stroke - center) * scale_factor
     
-    # 检查并修复拓扑结构
-    snapped_stroke = check_and_fix_topology(snapped_stroke, stroke)
+    # 检查并修复拓扑结构（根据配置决定是否启用）
+    if EdgeSnappingConfig.enable_topology_fix:
+        snapped_stroke = check_and_fix_topology(snapped_stroke, stroke)
     
     # 显式释放GPU内存 - 更彻底的清理
     del image_tensor_gray_chw
@@ -310,6 +321,72 @@ def check_and_fix_topology(snapped_stroke: np.ndarray, original_stroke: np.ndarr
         return fixed_stroke
     
     return snapped_stroke
+
+
+def resample_stroke_uniform(stroke: np.ndarray, target_num_points: int) -> np.ndarray:
+    """
+    对笔画进行均匀重采样，保持密度一致
+    
+    算法：
+    1. 计算沿笔画的累积弧长
+    2. 在累积弧长上均匀采样target_num_points个点
+    3. 使用线性插值得到新的点坐标
+    
+    Args:
+        stroke: 输入笔画，形状为(M, 2)
+        target_num_points: 目标点数N
+    
+    Returns:
+        重采样后的笔画，形状为(N, 2)
+    """
+    if len(stroke) < 2:
+        return stroke
+    
+    if len(stroke) == target_num_points:
+        return stroke
+    
+    # 计算每段边的长度
+    segments = stroke[1:] - stroke[:-1]  # (M-1, 2)
+    segment_lengths = np.linalg.norm(segments, axis=1)  # (M-1,)
+    
+    # 计算累积弧长
+    cumulative_lengths = np.zeros(len(stroke))
+    cumulative_lengths[1:] = np.cumsum(segment_lengths)
+    total_length = cumulative_lengths[-1]
+    
+    if total_length < 1e-6:
+        # 所有点几乎重合，返回重复的点
+        return np.tile(stroke[0], (target_num_points, 1))
+    
+    # 在累积弧长上均匀采样
+    target_lengths = np.linspace(0, total_length, target_num_points)
+    
+    # 对每个目标长度，使用线性插值找到对应的点
+    resampled_stroke = np.zeros((target_num_points, 2), dtype=np.float32)
+    
+    for i, target_length in enumerate(target_lengths):
+        # 找到target_length所在的段
+        # cumulative_lengths[j] <= target_length < cumulative_lengths[j+1]
+        idx = np.searchsorted(cumulative_lengths, target_length, side='right') - 1
+        idx = np.clip(idx, 0, len(stroke) - 2)
+        
+        # 在段内进行线性插值
+        segment_start_length = cumulative_lengths[idx]
+        segment_end_length = cumulative_lengths[idx + 1]
+        segment_length = segment_end_length - segment_start_length
+        
+        if segment_length < 1e-6:
+            # 段长度为0，使用起点
+            resampled_stroke[i] = stroke[idx]
+        else:
+            # 计算插值参数 t ∈ [0, 1]
+            t = (target_length - segment_start_length) / segment_length
+            t = np.clip(t, 0.0, 1.0)
+            
+            # 线性插值
+            resampled_stroke[i] = (1 - t) * stroke[idx] + t * stroke[idx + 1]
+    
+    return resampled_stroke
 
 
 def detect_crossings(stroke: np.ndarray) -> bool:
@@ -373,6 +450,101 @@ def segments_intersect(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.nd
     # (p1, p2, p3) 和 (p1, p2, p4) 的方向不同，且
     # (p3, p4, p1) 和 (p3, p4, p2) 的方向不同
     return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
+
+
+def uncross_by_local_adjustment(stroke: np.ndarray, original_stroke: np.ndarray, 
+                                max_iterations: int = 50, smoothing_factor: float = 0.3) -> np.ndarray:
+    """
+    通过局部位置调整消除笔画中的交叉
+    
+    算法策略：
+    1. 检测所有交叉的边对
+    2. 对交叉区域的点进行加权平滑调整
+    3. 参考原始stroke的位置，避免过度偏移
+    4. 保持点的数量和顺序不变
+    
+    调整方法：
+    - 对于交叉的边 (i, i+1) 和 (j, j+1)
+    - 调整 [i+1, j] 区间内的点位置
+    - 使用三方加权：当前位置(0.4) + 相邻点平均(0.3) + 原始位置(0.3)
+    
+    Args:
+        stroke: 笔画点数组，形状为(N, 2)
+        original_stroke: 原始笔画，用于参考
+        max_iterations: 最大迭代次数
+        smoothing_factor: 平滑强度 (0-1)，越大调整幅度越大
+    
+    Returns:
+        消除交叉后的笔画，形状为(N, 2)
+    """
+    n = len(stroke)
+    if n < 4:
+        return stroke
+    
+    # 复制stroke
+    current_stroke = stroke.copy()
+    
+    # 迭代消除交叉
+    for iteration in range(max_iterations):
+        # 收集所有交叉信息
+        crossings = []
+        
+        for i in range(n - 2):
+            p1 = current_stroke[i]
+            p2 = current_stroke[i + 1]
+            
+            for j in range(i + 2, n - 1):
+                if j == i + 1:  # 跳过相邻边
+                    continue
+                    
+                p3 = current_stroke[j]
+                p4 = current_stroke[j + 1]
+                
+                if segments_intersect(p1, p2, p3, p4):
+                    crossings.append((i, j))
+        
+        # 如果没有交叉，结束
+        if len(crossings) == 0:
+            break
+        
+        # 对每个交叉进行局部调整
+        adjustment_mask = np.zeros(n, dtype=bool)
+        adjustments = np.zeros((n, 2), dtype=np.float32)
+        
+        for (i, j) in crossings:
+            # 调整交叉区域中间的点 [i+1, j]
+            for k in range(i + 1, j + 1):
+                if k == 0 or k == n - 1:
+                    continue  # 不调整端点
+                
+                adjustment_mask[k] = True
+                
+                # 计算调整向量：使用相邻点的平均位置
+                if k > 0 and k < n - 1:
+                    # 目标位置：相邻点的平均
+                    neighbor_avg = (current_stroke[k - 1] + current_stroke[k + 1]) / 2.0
+                    
+                    # 参考原始位置
+                    if k < len(original_stroke):
+                        original_pos = original_stroke[k]
+                    else:
+                        original_pos = current_stroke[k]
+                    
+                    # 加权组合：当前位置(0.4) + 相邻平均(0.3) + 原始位置(0.3)
+                    target_pos = (0.4 * current_stroke[k] + 
+                                 0.3 * neighbor_avg + 
+                                 0.3 * original_pos)
+                    
+                    # 调整向量
+                    adjustments[k] = (target_pos - current_stroke[k]) * smoothing_factor
+        
+        # 应用调整
+        if adjustment_mask.any():
+            current_stroke[adjustment_mask] += adjustments[adjustment_mask]
+        else:
+            break  # 无法进一步调整
+    
+    return current_stroke
 
 def detect_direction_issues(snapped_stroke: np.ndarray, original_stroke: np.ndarray) -> bool:
     """
@@ -569,12 +741,13 @@ def enforce_minimum_distance(stroke: np.ndarray, original_stroke: np.ndarray) ->
     # 关键修复：使用固定的最大点数限制，防止点数无限增长
     # 如果original_stroke已经很大，使用固定限制；否则使用2倍限制
     original_len = len(original_stroke)
-    if original_len > 100:
-        # 如果原始stroke已经很大，使用固定限制（200点）
-        MAX_STROKE_POINTS = 200
+    max_points_config = EdgeSnappingConfig.max_stroke_points
+    if original_len > max_points_config // 2:
+        # 如果原始stroke已经很大，使用配置的限制
+        MAX_STROKE_POINTS = max_points_config
     else:
         # 如果原始stroke较小，使用2倍限制
-        MAX_STROKE_POINTS = min(original_len * 2, 200)  # 最多200点
+        MAX_STROKE_POINTS = min(original_len * 2, max_points_config)
     
     # 如果当前stroke已经超过限制，直接降采样返回
     if len(stroke) > MAX_STROKE_POINTS:
@@ -930,6 +1103,12 @@ def compute_weights(H: int, W: int,
     #     )
     #     weights = weights + EdgeSnappingConfig.lambda_length * length_term
 
+    # 交叉惩罚项（Crossing Penalty Term）
+    # 检测当前边是否与前一条边交叉，如果交叉则添加惩罚
+    if EdgeSnappingConfig.lambda_crossing > 0 and prev_q_i is not None:
+        crossing_penalty = compute_crossing_penalty(Q_i, Q_j, prev_q_i)
+        weights = weights + EdgeSnappingConfig.lambda_crossing * crossing_penalty
+
     # print(f"p_diff.shape = {p_diff.shape}")
     # print(f"q_diff.shape = {q_diff.shape}")
     # print(f"diff.shape = {diff.shape}")
@@ -939,6 +1118,79 @@ def compute_weights(H: int, W: int,
     return weights
 
 
+
+
+def compute_crossing_penalty(Q_i: np.ndarray, Q_j: np.ndarray, prev_q_i: np.ndarray) -> np.ndarray:
+    """
+    计算交叉惩罚项
+    
+    检测当前边 (Q_i -> Q_j) 是否与前一条边 (prev_q_i -> Q_i) 交叉
+    
+    算法：
+    对于边1: prev_q_i[k] -> Q_i[m]
+    对于边2: Q_i[m] -> Q_j[n]
+    检测这两条边是否交叉
+    
+    Args:
+        Q_i: 当前点的候选集，形状为(K_i, 2)
+        Q_j: 下一个点的候选集，形状为(K_j, 2)
+        prev_q_i: 前一个点的候选集，形状为(K_prev, 2)
+    
+    Returns:
+        惩罚矩阵，形状为(K_i, K_j)，如果交叉则为1，否则为0
+    """
+    K_i = Q_i.shape[0]
+    K_j = Q_j.shape[0]
+    K_prev = prev_q_i.shape[0]
+    
+    # 初始化惩罚矩阵
+    penalty = np.zeros((K_i, K_j), dtype=np.float32)
+    
+    # 对于每个Q_i[m]，我们需要找到它在prev_q_i中对应的最可能的前驱点
+    # 简化策略：对于Q_i[m]，找到与它最近的prev_q_i[k]，作为前一条边的起点
+    # 这样可以减少计算量
+    
+    for m in range(K_i):
+        q_i = Q_i[m]
+        
+        # 找到与q_i最近的prev_q_i点（作为前一条边的起点）
+        distances = np.sum((prev_q_i - q_i) ** 2, axis=1)
+        k_nearest = np.argmin(distances)
+        prev_q = prev_q_i[k_nearest]
+        
+        # 检测边 (prev_q -> q_i) 与 (q_i -> Q_j[n]) 是否交叉
+        for n in range(K_j):
+            q_j = Q_j[n]
+            
+            # 检测交叉（使用向量叉积）
+            # 边1: prev_q -> q_i
+            # 边2: q_i -> q_j
+            # 注意：这两条边共享点q_i，理论上不应该"交叉"
+            # 但我们可以检测它们是否形成"尖角"（接近180度转折）
+            
+            v1 = q_i - prev_q  # 边1的方向
+            v2 = q_j - q_i      # 边2的方向
+            
+            # 计算向量叉积
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            
+            # 计算向量长度
+            len_v1 = np.linalg.norm(v1)
+            len_v2 = np.linalg.norm(v2)
+            
+            if len_v1 > 1e-6 and len_v2 > 1e-6:
+                # 归一化的叉积
+                cross_norm = cross / (len_v1 * len_v2)
+                
+                # 如果叉积接近0，说明两条边接近平行或反向
+                # 如果夹角接近180度（向量点积为负且接近-1），说明有"尖角"
+                dot = np.dot(v1, v2) / (len_v1 * len_v2)
+                
+                # 检测尖角（夹角大于150度）
+                if dot < -0.866:  # cos(150°) ≈ -0.866
+                    penalty[m, n] = 1.0
+    
+    return penalty
 
 
 def compute_shape_constraint_term(p_i: np.ndarray, p_j: np.ndarray,

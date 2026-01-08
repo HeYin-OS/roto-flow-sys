@@ -13,6 +13,7 @@ snapping:
   # ========== 能量函数权重参数 ==========
   alpha: 0.1  # FDoG响应项（tilde_H_response）的权重系数
   lambda_deform: 1.0  # 形变项的权重，控制形变惩罚的强度
+  lambda_crossing: 0.0  # 交叉惩罚项的权重，惩罚尖角转折（>150度），从而避免交叉（已禁用）
   # lambda_shape: 0.0  # 形状约束项的权重（已禁用，仅保留核心算法）
   # lambda_topology: 0.0  # 拓扑顺序项的权重（已禁用，仅保留核心算法）
   # lambda_velocity: 0.0  # 速度约束项的权重（已禁用，仅保留核心算法）
@@ -24,10 +25,14 @@ snapping:
   # ========== 路径选择参数 ==========
   average_weight_threshold: 0.07  # 平均能量阈值，用于pick_best_path判断路径是否可接受
   
+  # ========== 拓扑修复参数 ==========
+  enable_topology_fix: true  # 是否启用拓扑修复（交叉检测、方向重排、删除过近点、插入点到过长边等）
+  max_stroke_points: 200  # stroke的最大点数限制，超过此值会进行降采样
+  
   # ========== Mask过滤参数 ==========
   erode_size: 2  # Mask腐蚀的核大小（像素），用于过滤物体内部的候选点
   dilate_size: 2  # Mask膨胀的核大小（像素），用于过滤物体外部的候选点
-  flow_erode_size: 1  # 光流截取时Mask腐蚀的核大小（像素），用于截取光流
+  flow_erode_size: 0  # 光流截取时Mask腐蚀的核大小（像素），用于截取光流
   
   # ========== 导出参数 ==========
   export_crop_ratio: 0.4  # PNG导出时的裁剪比例，从中心裁剪（0.5表示裁剪0.5H*0.5W的区域）
