@@ -22,6 +22,8 @@ COLOR_FLOW = (200, 130, 255)  # Soft Lavender
 COLOR_SNAPPING = (0, 150, 255)  # Tech Blue
 COLOR_FLOW_SNAPPED = (255, 100, 0)  # Orange Red
 COLOR_FITTED = (50, 200, 50)  # Fresh Green
+COLOR_DILATED_FLOW_SNAPPING = (255, 50, 150)  # Bright Pink - 膨胀光流+纯吸附
+COLOR_FLOW_FILTERED_SNAPPING = (0, 255, 200)  # Bright Cyan - 纯光流+过滤吸附
 THICKNESS = 2
 
 
@@ -52,14 +54,8 @@ class StrokeEnvironment:
         return self.paths.stroke / self.target_name
 
     @property
-    def cache_file(self) -> Path:
-        """Path to the optical-flow cache tensor for the current target (dilated flow, used for fitted)."""
-
-        return self.paths.cache / "flow-dilate" / f"{self.target_name}.pt"
-
-    @property
-    def flow_cache_file_unfiltered(self) -> Path:
-        """Path to the unfiltered optical-flow cache tensor for the current target (used for flow and flow_snapped)."""
+    def flow_cache_file(self) -> Path:
+        """Path to the optical-flow cache tensor for the current target."""
 
         return self.paths.cache / "flow" / f"{self.target_name}.pt"
 
@@ -137,8 +133,10 @@ class ViewerState:
     show_origin: bool = False
     show_snapping: bool = False  # z键：纯吸附结果
     show_flow: bool = False  # x键：纯光流结果
-    show_flow_snapped: bool = False  # c键：光流吸附结果
-    show_fitted: bool = True  # v键：fitted结果
+    show_flow_snapped: bool = False  # c键：纯光流+纯吸附结果
+    show_dilated_flow_snapping: bool = False  # v键：膨胀光流+纯吸附结果
+    show_flow_filtered_snapping: bool = False  # b键：纯光流+过滤吸附结果
+    show_fitted: bool = True  # n键：fitted结果（默认开启）
 
 
 @dataclass
@@ -148,6 +146,8 @@ class StrokeBuffers:
     flow: List[np.ndarray | None] = field(default_factory=list)
     snapping: List[np.ndarray | None] = field(default_factory=list)
     flow_snapped: List[np.ndarray | None] = field(default_factory=list)
+    dilated_flow_snapping: List[np.ndarray | None] = field(default_factory=list)
+    flow_filtered_snapping: List[np.ndarray | None] = field(default_factory=list)
     fitted: List[np.ndarray | None] = field(default_factory=list)
 
     def reset(self, n_frame: int) -> None:
@@ -156,6 +156,8 @@ class StrokeBuffers:
         self.flow = [None] * n_frame
         self.snapping = [None] * n_frame
         self.flow_snapped = [None] * n_frame
+        self.dilated_flow_snapping = [None] * n_frame
+        self.flow_filtered_snapping = [None] * n_frame
         self.fitted = [None] * n_frame
 
 
@@ -164,9 +166,9 @@ class StrokeData:
     """In-memory data required to propagate strokes over all frames."""
 
     images_rgb: np.ndarray
-    flow_nhw2: np.ndarray  # 膨胀后的光流（用于fitted）
-    flow_nhw2_unfiltered: np.ndarray  # 未膨胀的光流（用于flow和flow_snapped）
-    kd_tree: BatchKDTree  # 使用过滤后的候选点
+    flow_nhw2: np.ndarray  # 处理后的光流（mask腐蚀+光流膨胀，用于fitted策略）
+    flow_nhw2_unfiltered: np.ndarray  # 原始光流（从/cache/flow/读取，用于flow、flow_snapped、snapping策略）
+    kd_tree: BatchKDTree  # 使用过滤后的候选点（mask腐蚀+膨胀过滤）
     kd_tree_unfiltered: BatchKDTree = None  # 使用未过滤的候选点（用于纯光流和纯吸附）
     original_stroke_length: float = None  # 第一帧原始stroke的长度（用于长度约束）
 
@@ -281,21 +283,12 @@ def read_images_batch(paths: List[Path], flag: Any) -> np.ndarray:
 
 
 def read_optical_flow_cache(env: StrokeEnvironment) -> Tensor:
-    """Load the precomputed optical-flow tensor for the configured target (dilated flow)."""
+    """Load the precomputed optical-flow tensor for the configured target."""
 
-    cache_path = env.cache_file
+    cache_path = env.flow_cache_file
     if cache_path.exists():
         return torch.load(str(cache_path))
     raise ValueError(f"Optical flow cache file does not exist: {cache_path}")
-
-
-def read_optical_flow_cache_unfiltered(env: StrokeEnvironment) -> Tensor:
-    """Load the unfiltered optical-flow tensor for the configured target (unfiltered flow)."""
-
-    cache_path = env.flow_cache_file_unfiltered
-    if cache_path.exists():
-        return torch.load(str(cache_path))
-    raise ValueError(f"Unfiltered optical flow cache file does not exist: {cache_path}")
 
 
 def read_mask_cache(env: StrokeEnvironment) -> np.ndarray:
@@ -310,17 +303,25 @@ def read_mask_cache(env: StrokeEnvironment) -> np.ndarray:
     raise ValueError(f"Mask cache file does not exist: {cache_path}")
 
 
-def erode_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+def erode_mask(mask: np.ndarray, thickness: int) -> np.ndarray:
     """
     对mask进行形态学腐蚀
     
     Args:
         mask: 二值mask，形状为(H, W)，值为0或1
-        kernel_size: 腐蚀核大小（像素宽度）
+        thickness: 腐蚀厚度（像素），表示从边界向内侵蚀的像素数
     
     Returns:
         腐蚀后的mask
+    
+    Note:
+        - thickness=1: 边界向内侵蚀约1像素（核大小3x3）
+        - thickness=3: 边界向内侵蚀约3像素（核大小7x7）
+        - thickness=5: 边界向内侵蚀约5像素（核大小11x11）
     """
+    if thickness <= 0:
+        return mask.copy()
+    
     # 确保mask是uint8类型
     if mask.dtype != np.uint8:
         mask_uint8 = (mask * 255).astype(np.uint8)
@@ -328,7 +329,8 @@ def erode_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
         mask_uint8 = mask
 
     # 创建圆形结构元素
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    # thickness表示腐蚀厚度，核大小 = 2*thickness + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
 
     # 执行腐蚀操作
     eroded = cv2.erode(mask_uint8, kernel, iterations=1)
@@ -337,17 +339,25 @@ def erode_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
     return (eroded / 255.0).astype(np.float32)
 
 
-def dilate_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+def dilate_mask(mask: np.ndarray, thickness: int) -> np.ndarray:
     """
     对mask进行形态学膨胀
     
     Args:
         mask: 二值mask，形状为(H, W)，值为0或1
-        kernel_size: 膨胀核大小（像素宽度）
+        thickness: 膨胀厚度（像素），表示从边界向外扩展的像素数
     
     Returns:
         膨胀后的mask
+    
+    Note:
+        - thickness=1: 边界向外扩展约1像素（核大小3x3）
+        - thickness=3: 边界向外扩展约3像素（核大小7x7）
+        - thickness=5: 边界向外扩展约5像素（核大小11x11）
     """
+    if thickness <= 0:
+        return mask.copy()
+    
     # 确保mask是uint8类型
     if mask.dtype != np.uint8:
         mask_uint8 = (mask * 255).astype(np.uint8)
@@ -355,7 +365,8 @@ def dilate_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
         mask_uint8 = mask
 
     # 创建圆形结构元素
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    # thickness表示膨胀厚度，核大小 = 2*thickness + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
 
     # 执行膨胀操作
     dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
@@ -444,37 +455,60 @@ def generate_salient_filtered_images(env: StrokeEnvironment, points_all_candidat
         cv2.imwrite(str(file_path), canvas)
 
 
-def flow_to_bgr(flow: np.ndarray) -> np.ndarray:
+def flow_batch_to_bgr_images(flows: np.ndarray) -> np.ndarray:
     """
-    将光流转换为BGR可视化图像（使用torchvision的flow_to_image函数）
-    统一的光流可视化标准，输出BGR格式用于OpenCV保存
+    批量将光流转换为BGR可视化图像（使用torchvision的flow_to_image函数）
+    这是统一的光流可视化标准函数，确保颜色空间正确
     
     Args:
-        flow: 光流数组，形状为(H, W, 2)，值为[dx, dy]
+        flows: 光流数组，形状为(N, H, W, 2)，值为[dx, dy]
     
     Returns:
-        BGR图像，形状为(H, W, 3)，值范围0-255，uint8类型
+        BGR图像数组，形状为(N, H, W, 3)，值范围0-255，uint8类型
     """
-    # 将numpy数组转换为torch tensor
-    # flow格式: (H, W, 2) -> 需要转换为 (2, H, W)
-    flow_tensor = torch.from_numpy(flow).float()
-    flow_tensor = flow_tensor.permute(2, 0, 1)  # (2, H, W)
-    
-    # 添加batch维度: (1, 2, H, W)
-    flow_tensor = flow_tensor.unsqueeze(0)
+    # 转换为torch tensor: (N, H, W, 2) -> (N, 2, H, W)
+    flow_tensor = torch.from_numpy(flows).float()
+    flow_tensor = flow_tensor.permute(0, 3, 1, 2)  # (N, 2, H, W)
     
     # 使用torchvision的flow_to_image函数
-    # 返回形状: (1, 3, H, W)，值范围0-255，RGB格式
+    # 输入: (N, 2, H, W) - 光流的 x, y 分量
+    # 输出: (N, 3, H, W) - RGB图像，dtype=uint8，值范围0-255
     rgb_tensor = flow_to_image(flow_tensor)
     
-    # 转换为numpy并调整维度: (1, 3, H, W) -> (H, W, 3)
-    rgb_np = rgb_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
-    rgb_np = rgb_np.astype(np.uint8)
+    # 转换为numpy: (N, 3, H, W) -> (N, H, W, 3)
+    # flow_to_image 已经返回 uint8 类型，范围 0-255
+    rgb_images = rgb_tensor.permute(0, 2, 3, 1).cpu().numpy()  # (N, H, W, 3)
     
-    # 转换为BGR格式（OpenCV保存格式）
-    bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+    # 批量转换RGB为BGR（OpenCV格式）
+    bgr_images = np.empty_like(rgb_images)
+    for i in range(rgb_images.shape[0]):
+        bgr_images[i] = cv2.cvtColor(rgb_images[i], cv2.COLOR_RGB2BGR)
     
-    return bgr_np
+    return bgr_images
+
+
+def save_flow_images_to_dir(flow_images_bgr: np.ndarray, work_dir: Path, desc: str) -> None:
+    """
+    统一的光流图像保存函数
+    
+    Args:
+        flow_images_bgr: BGR格式的光流图像，形状为(N, H, W, 3)，uint8类型
+        work_dir: 保存目录
+        desc: 进度条描述
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = flow_images_bgr.shape[0]
+    
+    for i in tqdm(range(n_frames), desc=desc, unit=" image(s)"):
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), flow_images_bgr[i])
 
 
 def generate_flow_original_images(env: StrokeEnvironment, flows: np.ndarray) -> None:
@@ -485,26 +519,11 @@ def generate_flow_original_images(env: StrokeEnvironment, flows: np.ndarray) -> 
         env: 环境配置
         flows: 原始光流数组，形状为(N, H, W, 2)
     """
-    work_dir = env.flow_original_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
+    # 批量转换光流为BGR图像
+    flow_images_bgr = flow_batch_to_bgr_images(flows)
     
-    # 清空目录中的文件（不删除目录）
-    if work_dir.exists():
-        for file_path in work_dir.iterdir():
-            if file_path.is_file():
-                file_path.unlink()
-    
-    n_frames = flows.shape[0]
-    
-    for i in tqdm(range(n_frames), desc="Generating original flow images:", unit=" image(s)"):
-        flow = flows[i]  # 形状: (H, W, 2)
-        
-        # 转换为BGR可视化（使用统一的torchvision标准）
-        flow_bgr = flow_to_bgr(flow)
-        
-        # 保存图像
-        file_path = work_dir / f"{i:05d}.png"
-        cv2.imwrite(str(file_path), flow_bgr)
+    # 保存到目录
+    save_flow_images_to_dir(flow_images_bgr, env.flow_original_dir, "Generating original flow images:")
 
 
 def generate_mask_original_images(env: StrokeEnvironment, masks: np.ndarray) -> None:
@@ -532,18 +551,27 @@ def generate_mask_original_images(env: StrokeEnvironment, masks: np.ndarray) -> 
         # 转换为uint8 (0-255)
         mask_uint8 = (mask * 255).astype(np.uint8)
         
-        # 保存图像
+        # 创建彩色版本（绿色）用于更好的可视化
+        mask_colored = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+        mask_colored[:, :, 1] = mask_uint8  # 绿色通道
+        
+        # 保存灰度图像
         file_path = work_dir / f"{i:05d}.png"
         cv2.imwrite(str(file_path), mask_uint8)
+        
+        # 保存彩色图像
+        file_path_colored = work_dir / f"{i:05d}_colored.png"
+        cv2.imwrite(str(file_path_colored), mask_colored)
 
 
-def generate_mask_erode_images(env: StrokeEnvironment, masks_eroded: np.ndarray) -> None:
+def generate_mask_erode_images(env: StrokeEnvironment, masks_eroded: np.ndarray, masks_original: np.ndarray = None) -> None:
     """
-    生成腐蚀后mask的可视化图像
+    生成腐蚀后mask的可视化图像（包含对比图和差异图）
     
     Args:
         env: 环境配置
         masks_eroded: 腐蚀后的mask数组，形状为(N, H, W)，值为0-1
+        masks_original: 原始mask数组，形状为(N, H, W)，值为0-1（用于生成对比图）
     """
     work_dir = env.mask_erode_dir
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -562,18 +590,44 @@ def generate_mask_erode_images(env: StrokeEnvironment, masks_eroded: np.ndarray)
         # 转换为uint8 (0-255)
         mask_uint8 = (mask * 255).astype(np.uint8)
         
-        # 保存图像
+        # 保存灰度图像
         file_path = work_dir / f"{i:05d}.png"
         cv2.imwrite(str(file_path), mask_uint8)
+        
+        # 如果提供了原始mask，生成对比图和差异图
+        if masks_original is not None and i < masks_original.shape[0]:
+            mask_orig = masks_original[i]
+            mask_orig_uint8 = (mask_orig * 255).astype(np.uint8)
+            
+            # 创建对比图（原始=红色，腐蚀后=绿色，重叠=黄色）
+            comparison = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            comparison[:, :, 2] = mask_orig_uint8  # 红色：原始mask
+            comparison[:, :, 1] = mask_uint8  # 绿色：腐蚀后mask
+            # 重叠部分会显示为黄色（红+绿）
+            
+            # 保存对比图
+            file_path_comp = work_dir / f"{i:05d}_comparison.png"
+            cv2.imwrite(str(file_path_comp), comparison)
+            
+            # 创建差异图（显示被腐蚀掉的区域）
+            diff = mask_orig_uint8 - mask_uint8  # 被腐蚀掉的部分
+            diff_colored = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            diff_colored[:, :, 0] = diff  # 蓝色：被腐蚀掉的边界
+            diff_colored[:, :, 1] = mask_uint8  # 绿色：腐蚀后的mask
+            
+            # 保存差异图
+            file_path_diff = work_dir / f"{i:05d}_diff.png"
+            cv2.imwrite(str(file_path_diff), diff_colored)
 
 
-def generate_mask_dilate_images(env: StrokeEnvironment, masks_dilated: np.ndarray) -> None:
+def generate_mask_dilate_images(env: StrokeEnvironment, masks_dilated: np.ndarray, masks_original: np.ndarray = None) -> None:
     """
-    生成膨胀后mask的可视化图像
+    生成膨胀后mask的可视化图像（包含对比图和差异图）
     
     Args:
         env: 环境配置
         masks_dilated: 膨胀后的mask数组，形状为(N, H, W)，值为0-1
+        masks_original: 原始mask数组，形状为(N, H, W)，值为0-1（用于生成对比图）
     """
     work_dir = env.mask_dilate_dir
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -592,9 +646,104 @@ def generate_mask_dilate_images(env: StrokeEnvironment, masks_dilated: np.ndarra
         # 转换为uint8 (0-255)
         mask_uint8 = (mask * 255).astype(np.uint8)
         
-        # 保存图像
+        # 保存灰度图像
         file_path = work_dir / f"{i:05d}.png"
         cv2.imwrite(str(file_path), mask_uint8)
+        
+        # 如果提供了原始mask，生成对比图和差异图
+        if masks_original is not None and i < masks_original.shape[0]:
+            mask_orig = masks_original[i]
+            mask_orig_uint8 = (mask_orig * 255).astype(np.uint8)
+            
+            # 创建对比图（原始=红色，膨胀后=绿色，重叠=黄色）
+            comparison = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            comparison[:, :, 2] = mask_orig_uint8  # 红色：原始mask
+            comparison[:, :, 1] = mask_uint8  # 绿色：膨胀后mask
+            # 重叠部分会显示为黄色（红+绿）
+            
+            # 保存对比图
+            file_path_comp = work_dir / f"{i:05d}_comparison.png"
+            cv2.imwrite(str(file_path_comp), comparison)
+            
+            # 创建差异图（显示膨胀增加的区域）
+            diff = mask_uint8 - mask_orig_uint8  # 膨胀增加的部分
+            diff_colored = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            diff_colored[:, :, 0] = diff  # 蓝色：膨胀增加的边界
+            diff_colored[:, :, 2] = mask_orig_uint8  # 红色：原始mask
+            
+            # 保存差异图
+            file_path_diff = work_dir / f"{i:05d}_diff.png"
+            cv2.imwrite(str(file_path_diff), diff_colored)
+
+
+def generate_mask_triple_comparison(env: StrokeEnvironment, masks_original: np.ndarray, 
+                                   masks_eroded: np.ndarray, masks_dilated: np.ndarray) -> None:
+    """
+    生成三合一对比图：原始、腐蚀、膨胀同时显示
+    
+    Args:
+        env: 环境配置
+        masks_original: 原始mask数组，形状为(N, H, W)
+        masks_eroded: 腐蚀后mask数组，形状为(N, H, W)
+        masks_dilated: 膨胀后mask数组，形状为(N, H, W)
+    """
+    work_dir = env.intermediates_dir / "mask-comparison"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = min(masks_original.shape[0], masks_eroded.shape[0], masks_dilated.shape[0])
+    
+    for i in tqdm(range(n_frames), desc="Generating mask comparison images:", unit=" image(s)"):
+        mask_orig = masks_original[i]
+        mask_erode = masks_eroded[i]
+        mask_dilate = masks_dilated[i]
+        
+        H, W = mask_orig.shape
+        
+        # 创建三合一彩色对比图
+        # 蓝色：腐蚀后的区域（最小）
+        # 红色：原始mask区域（中等）
+        # 绿色：膨胀后的区域（最大）
+        comparison = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        # 蓝色：腐蚀后mask
+        comparison[:, :, 0] = (mask_erode * 255).astype(np.uint8)
+        
+        # 红色：原始mask
+        comparison[:, :, 2] = (mask_orig * 255).astype(np.uint8)
+        
+        # 绿色：膨胀后mask
+        comparison[:, :, 1] = (mask_dilate * 255).astype(np.uint8)
+        
+        # 保存对比图
+        file_path = work_dir / f"{i:05d}_triple.png"
+        cv2.imwrite(str(file_path), comparison)
+        
+        # 创建边界对比图（只显示边界差异）
+        edge_comparison = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        # 红色：被腐蚀掉的边界（原始 - 腐蚀）
+        eroded_boundary = ((mask_orig - mask_erode) * 255).astype(np.uint8)
+        edge_comparison[:, :, 2] = eroded_boundary
+        
+        # 绿色：膨胀增加的边界（膨胀 - 原始）
+        dilated_boundary = ((mask_dilate - mask_orig) * 255).astype(np.uint8)
+        edge_comparison[:, :, 1] = dilated_boundary
+        
+        # 蓝色：原始mask边界
+        orig_uint8 = (mask_orig * 255).astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        orig_edge = cv2.morphologyEx(orig_uint8, cv2.MORPH_GRADIENT, kernel)
+        edge_comparison[:, :, 0] = orig_edge
+        
+        # 保存边界对比图
+        file_path_edge = work_dir / f"{i:05d}_edges.png"
+        cv2.imwrite(str(file_path_edge), edge_comparison)
 
 
 def generate_flow_crop_by_mask_images(env: StrokeEnvironment, flows: np.ndarray, masks_eroded: np.ndarray) -> np.ndarray:
@@ -609,56 +758,43 @@ def generate_flow_crop_by_mask_images(env: StrokeEnvironment, flows: np.ndarray,
     Returns:
         flow_cropped: 裁剪后的光流数组，形状为(N, H, W, 2)
     """
-
-    work_dir = env.flow_crop_by_mask_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 清空目录中的文件（不删除目录）
-    if work_dir.exists():
-        for file_path in work_dir.iterdir():
-            if file_path.is_file():
-                file_path.unlink()
-    
     # 光流帧数是N-1帧，mask帧数是N帧
     n_frames = min(flows.shape[0], masks_eroded.shape[0])
     
     # 创建裁剪后的光流数组
     flow_cropped = np.zeros_like(flows[:n_frames])
     
-    for i in tqdm(range(n_frames), desc="Generating flow cropped by mask images:", unit=" image(s)"):
-        flow = flows[i]  # 形状: (H, W, 2)
-        # 使用第i帧的腐蚀mask（光流是从frame i到frame i+1）
-        mask_eroded = masks_eroded[i]
-        
+    for i in range(n_frames):
         # 将mask扩展到光流的通道维度
-        mask_3d = np.stack([mask_eroded, mask_eroded], axis=-1)  # (H, W, 2)
+        mask_3d = np.stack([masks_eroded[i], masks_eroded[i]], axis=-1)  # (H, W, 2)
         
         # 应用mask（在mask外的地方设为0）
-        flow_masked = flow * mask_3d
-        flow_cropped[i] = flow_masked
-        
-        # 转换为BGR可视化（使用统一的torchvision标准）
-        flow_bgr = flow_to_bgr(flow_masked)
-        
-        # 保存图像
-        file_path = work_dir / f"{i:05d}.png"
-        cv2.imwrite(str(file_path), flow_bgr)
+        flow_cropped[i] = flows[i] * mask_3d
+    
+    # 批量转换光流为BGR图像并保存
+    flow_images_bgr = flow_batch_to_bgr_images(flow_cropped)
+    save_flow_images_to_dir(flow_images_bgr, env.flow_crop_by_mask_dir, "Generating flow cropped by mask images:")
     
     return flow_cropped
 
 
-def dilate_flow_binary(flow: np.ndarray, kernel_size: int) -> np.ndarray:
+def dilate_flow_binary(flow: np.ndarray, thickness: int) -> np.ndarray:
     """
     将光流按照二值对待进行膨胀
     
     Args:
         flow: 光流数组，形状为(H, W, 2)，值为[dx, dy]
-        kernel_size: 膨胀核大小（像素宽度）
+        thickness: 膨胀厚度（像素），表示从有效光流区域向外扩展的像素数
     
     Returns:
         膨胀后的光流，形状为(H, W, 2)
+    
+    Note:
+        - thickness=1: 向外扩展约1像素（核大小3x3）
+        - thickness=3: 向外扩展约3像素（核大小7x7）
+        - thickness=5: 向外扩展约5像素（核大小11x11）
     """
-    if kernel_size <= 0:
+    if thickness <= 0:
         return flow
     
     H, W = flow.shape[:2]
@@ -668,7 +804,8 @@ def dilate_flow_binary(flow: np.ndarray, kernel_size: int) -> np.ndarray:
     binary_mask = (flow_magnitude > 1e-6).astype(np.uint8)
     
     # 创建圆形结构元素
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    # thickness表示膨胀厚度，核大小 = 2*thickness + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
     
     # 对二值mask进行膨胀
     dilated_mask = cv2.dilate(binary_mask, kernel, iterations=1)
@@ -702,43 +839,28 @@ def dilate_flow_binary(flow: np.ndarray, kernel_size: int) -> np.ndarray:
     return flow_dilated
 
 
-def generate_flow_dilate_only_images(env: StrokeEnvironment, flows_cropped: np.ndarray, kernel_size: int) -> np.ndarray:
+def generate_flow_dilate_only_images(env: StrokeEnvironment, flows_cropped: np.ndarray, thickness: int) -> np.ndarray:
     """
     对裁剪后的光流进行膨胀，并生成可视化图像（仅显示膨胀部分）
     
     Args:
         env: 环境配置
         flows_cropped: 裁剪后的光流数组，形状为(N, H, W, 2)
-        kernel_size: 膨胀核大小
+        thickness: 膨胀厚度（像素）
     
     Returns:
         flow_dilated: 膨胀后的光流数组，形状为(N, H, W, 2)
     """
-    work_dir = env.flow_dilate_only_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 清空目录中的文件（不删除目录）
-    if work_dir.exists():
-        for file_path in work_dir.iterdir():
-            if file_path.is_file():
-                file_path.unlink()
-    
     n_frames = flows_cropped.shape[0]
     flow_dilated = np.zeros_like(flows_cropped)
     
-    for i in tqdm(range(n_frames), desc=f"Generating dilated flow images (kernel_size={kernel_size}):", unit=" image(s)"):
-        flow = flows_cropped[i]  # 形状: (H, W, 2)
-        
-        # 对光流进行膨胀
-        flow_dilated_frame = dilate_flow_binary(flow, kernel_size)
-        flow_dilated[i] = flow_dilated_frame
-        
-        # 转换为BGR可视化（使用统一的torchvision标准）
-        flow_bgr = flow_to_bgr(flow_dilated_frame)
-        
-        # 保存图像
-        file_path = work_dir / f"{i:05d}.png"
-        cv2.imwrite(str(file_path), flow_bgr)
+    # 对每帧光流进行膨胀
+    for i in tqdm(range(n_frames), desc=f"Dilating flow ({thickness}px thickness):", unit=" frame(s)"):
+        flow_dilated[i] = dilate_flow_binary(flows_cropped[i], thickness)
+    
+    # 批量转换光流为BGR图像并保存
+    flow_images_bgr = flow_batch_to_bgr_images(flow_dilated)
+    save_flow_images_to_dir(flow_images_bgr, env.flow_dilate_only_dir, "Saving dilated flow images:")
     
     return flow_dilated
 
@@ -755,36 +877,22 @@ def generate_flow_dilate_final_images(env: StrokeEnvironment, flows_original: np
     Returns:
         flow_final: 最终的光流数组，形状为(N, H, W, 2)
     """
-    work_dir = env.flow_dilate_final_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 清空目录中的文件（不删除目录）
-    if work_dir.exists():
-        for file_path in work_dir.iterdir():
-            if file_path.is_file():
-                file_path.unlink()
-    
     n_frames = min(flows_original.shape[0], flows_dilated.shape[0])
     flow_final = flows_original[:n_frames].copy()
     
-    for i in tqdm(range(n_frames), desc="Generating final dilated flow images:", unit=" image(s)"):
-        flow_orig = flows_original[i]  # 形状: (H, W, 2)
-        flow_dil = flows_dilated[i]  # 形状: (H, W, 2)
-        
+    # 合并膨胀光流到原始光流
+    for i in range(n_frames):
         # 创建mask：膨胀光流有值的地方
-        flow_dil_magnitude = np.sqrt(flow_dil[:, :, 0]**2 + flow_dil[:, :, 1]**2)
+        flow_dil_magnitude = np.sqrt(flows_dilated[i, :, :, 0]**2 + flows_dilated[i, :, :, 1]**2)
         has_dilated_flow = flow_dil_magnitude > 1e-6
         
         # 将膨胀光流覆盖回原始光流（只在有值的地方覆盖）
         mask_3d = np.stack([has_dilated_flow, has_dilated_flow], axis=-1)
-        flow_final[i] = np.where(mask_3d, flow_dil, flow_orig)
-        
-        # 转换为BGR可视化（使用统一的torchvision标准）
-        flow_bgr = flow_to_bgr(flow_final[i])
-        
-        # 保存图像
-        file_path = work_dir / f"{i:05d}.png"
-        cv2.imwrite(str(file_path), flow_bgr)
+        flow_final[i] = np.where(mask_3d, flows_dilated[i], flows_original[i])
+    
+    # 批量转换光流为BGR图像并保存
+    flow_images_bgr = flow_batch_to_bgr_images(flow_final)
+    save_flow_images_to_dir(flow_images_bgr, env.flow_dilate_final_dir, "Generating final dilated flow images:")
     
     return flow_final
 
@@ -809,7 +917,11 @@ def rgb_to_bgr(color: tuple) -> tuple:
 def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, stroke_0: np.ndarray) -> None:
     """Snap the reference stroke onto frame-0 edges prior to propagation."""
 
-    # 生成fitted结果（使用过滤后的候选点）
+    # 保存原始拓扑修复设置
+    original_topology_fix = EdgeSnappingConfig.enable_topology_fix
+
+    # 生成fitted结果（使用过滤后的候选点，启用拓扑修复）
+    EdgeSnappingConfig.enable_topology_fix = True
     points_stroke_candidate = data.kd_tree.query_batch(
         0,
         stroke_0,
@@ -824,7 +936,8 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     )
     buffers.fitted[0] = stroke_0_snapped.astype(np.float32)
 
-    # 生成snapping结果（使用未过滤的候选点）
+    # 生成snapping结果（使用未过滤的候选点，禁用拓扑修复）
+    EdgeSnappingConfig.enable_topology_fix = False
     points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
         0,
         stroke_0,
@@ -839,20 +952,38 @@ def generate_prediction_stroke_on_0(buffers: StrokeBuffers, data: StrokeData, st
     )
     buffers.snapping[0] = stroke_0_snapping.astype(np.float32)
 
-    # 生成flow结果（第0帧使用未过滤点集吸附）
-    buffers.flow[0] = stroke_0_snapping.astype(np.float32)
+    # 生成flow结果（第0帧直接复制原始测试笔画，不进行吸附）
+    buffers.flow[0] = stroke_0.astype(np.float32)
 
-    # 生成flow_snapped结果（第0帧使用未过滤点集的吸附结果）
+    # 生成flow_snapped结果（第0帧使用未过滤点集的吸附结果，禁用拓扑修复）
     buffers.flow_snapped[0] = stroke_0_snapping.astype(np.float32)
+
+    # 生成dilated_flow_snapping结果（第0帧使用未过滤点集的吸附结果，禁用拓扑修复）
+    buffers.dilated_flow_snapping[0] = stroke_0_snapping.astype(np.float32)
+
+    # 生成flow_filtered_snapping结果（第0帧使用过滤后候选点的吸附结果，禁用拓扑修复）
+    stroke_0_filtered_snapping = local_snapping(
+        stroke_0,
+        data.images_rgb[0],
+        points_stroke_candidate,  # 使用过滤后的候选点
+        previous_snapped_stroke=None,
+        original_stroke_length=data.original_stroke_length,
+    )
+    buffers.flow_filtered_snapping[0] = stroke_0_filtered_snapping.astype(np.float32)
+
+    # 恢复原始拓扑修复设置
+    EdgeSnappingConfig.enable_topology_fix = original_topology_fix
     
-    # 输出第0帧四种预测结果的形状
+    # 输出第0帧所有预测结果的形状
     print("\n" + "=" * 60)
     print("Frame 0 预测结果形状:")
     print("=" * 60)
     print(f"  Original stroke shape: {stroke_0.shape}, dtype: {stroke_0.dtype}")
-    print(f"  Snapping shape: {buffers.snapping[0].shape}, dtype: {buffers.snapping[0].dtype}")
-    print(f"  Flow shape: {buffers.flow[0].shape}, dtype: {buffers.flow[0].dtype}")
-    print(f"  Flow_snapped shape: {buffers.flow_snapped[0].shape}, dtype: {buffers.flow_snapped[0].dtype}")
+    print(f"  Pure snapping shape: {buffers.snapping[0].shape}, dtype: {buffers.snapping[0].dtype}")
+    print(f"  Pure flow shape: {buffers.flow[0].shape}, dtype: {buffers.flow[0].dtype}")
+    print(f"  Pure flow + pure snapping shape: {buffers.flow_snapped[0].shape}, dtype: {buffers.flow_snapped[0].dtype}")
+    print(f"  Dilated flow + pure snapping shape: {buffers.dilated_flow_snapping[0].shape}, dtype: {buffers.dilated_flow_snapping[0].dtype}")
+    print(f"  Pure flow + filtered snapping shape: {buffers.flow_filtered_snapping[0].shape}, dtype: {buffers.flow_filtered_snapping[0].dtype}")
     print(f"  Fitted shape: {buffers.fitted[0].shape}, dtype: {buffers.fitted[0].dtype}")
     print("=" * 60 + "\n")
 
@@ -895,6 +1026,10 @@ def generate_snapping_prediction(
     # 获取前一帧的snapping结果用于速度约束
     previous_snapped_stroke = buffers.snapping[i_frame - 1] if i > 0 else None
     
+    # 禁用拓扑修复
+    original_topology_fix = EdgeSnappingConfig.enable_topology_fix
+    EdgeSnappingConfig.enable_topology_fix = False
+    
     stroke_snapping = local_snapping(
         previous_snapping,
         data.images_rgb[i_frame],
@@ -902,6 +1037,9 @@ def generate_snapping_prediction(
         previous_snapped_stroke=previous_snapped_stroke,
         original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
     )
+    
+    # 恢复拓扑修复设置
+    EdgeSnappingConfig.enable_topology_fix = original_topology_fix
     
     return stroke_snapping
 
@@ -1003,6 +1141,10 @@ def generate_flow_snapped_prediction(
     # 获取前一帧的flow_snapped结果用于速度约束
     previous_snapped_stroke = buffers.flow_snapped[i_frame - 1] if i > 0 else None
     
+    # 禁用拓扑修复
+    original_topology_fix = EdgeSnappingConfig.enable_topology_fix
+    EdgeSnappingConfig.enable_topology_fix = False
+    
     stroke_flow_snapped = local_snapping(
         stroke_after_flow,
         data.images_rgb[i_frame],
@@ -1011,7 +1153,144 @@ def generate_flow_snapped_prediction(
         original_stroke_length=data.original_stroke_length,  # 传递原始长度用于长度约束
     )
     
+    # 恢复拓扑修复设置
+    EdgeSnappingConfig.enable_topology_fix = original_topology_fix
+    
     return stroke_flow_snapped
+
+
+def generate_dilated_flow_snapping_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    生成当前帧的dilated_flow_snapping预测结果。
+    先用处理后的光流（膨胀光流）传播，再用未过滤候选点吸附。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的stroke（未使用，保留以保持接口一致）
+        buffers: 存储预测结果的缓冲区
+        data: 包含图像、光流和KD树的数据
+        H: 图像高度
+        W: 图像宽度
+    
+    Returns:
+        当前帧的dilated_flow_snapping预测结果
+    """
+    # 使用自身的数据进行传播
+    previous_dilated_flow_snapping = buffers.dilated_flow_snapping[i_frame - 1]
+    if previous_dilated_flow_snapping is None:
+        raise RuntimeError(f"Missing dilated_flow_snapping stroke for frame {i_frame - 1}")
+
+    # 第一步：光流传播（使用处理后的光流：膨胀光流）
+    x, y = previous_dilated_flow_snapping[:, 0], previous_dilated_flow_snapping[:, 1]
+
+    # 边界检查：确保索引在有效范围内
+    x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
+    y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
+    flow_vectors = data.flow_nhw2[i_frame - 1, y_clipped, x_clipped]  # 使用膨胀光流
+    stroke_after_flow = previous_dilated_flow_snapping + flow_vectors
+
+    # 第二步：使用未过滤的候选点进行吸附（禁用拓扑修复）
+    points_stroke_candidate_unfiltered = data.kd_tree_unfiltered.query_batch(
+        i_frame,
+        stroke_after_flow,
+        EdgeSnappingConfig.r_s,
+    )
+
+    # 获取前一帧的结果用于速度约束
+    previous_snapped_stroke = buffers.dilated_flow_snapping[i_frame - 1] if i > 0 else None
+    
+    # 禁用拓扑修复
+    original_topology_fix = EdgeSnappingConfig.enable_topology_fix
+    EdgeSnappingConfig.enable_topology_fix = False
+    
+    stroke_dilated_flow_snapping = local_snapping(
+        stroke_after_flow,
+        data.images_rgb[i_frame],
+        points_stroke_candidate_unfiltered,  # 使用未过滤的候选点
+        previous_snapped_stroke=previous_snapped_stroke,
+        original_stroke_length=data.original_stroke_length,
+    )
+    
+    # 恢复拓扑修复设置
+    EdgeSnappingConfig.enable_topology_fix = original_topology_fix
+    
+    return stroke_dilated_flow_snapping
+
+
+def generate_flow_filtered_snapping_prediction(
+    i_frame: int,
+    i: int,
+    stroke_copied: np.ndarray,
+    buffers: StrokeBuffers,
+    data: StrokeData,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    生成当前帧的flow_filtered_snapping预测结果。
+    先用原始光流传播，再用过滤后候选点吸附。
+    
+    Args:
+        i_frame: 当前帧索引
+        i: 循环索引（用于判断是否是第一帧）
+        stroke_copied: 从前一帧复制的stroke（未使用，保留以保持接口一致）
+        buffers: 存储预测结果的缓冲区
+        data: 包含图像、光流和KD树的数据
+        H: 图像高度
+        W: 图像宽度
+    
+    Returns:
+        当前帧的flow_filtered_snapping预测结果
+    """
+    # 使用自身的数据进行传播
+    previous_flow_filtered_snapping = buffers.flow_filtered_snapping[i_frame - 1]
+    if previous_flow_filtered_snapping is None:
+        raise RuntimeError(f"Missing flow_filtered_snapping stroke for frame {i_frame - 1}")
+
+    # 第一步：光流传播（使用原始光流）
+    x, y = previous_flow_filtered_snapping[:, 0], previous_flow_filtered_snapping[:, 1]
+
+    # 边界检查：确保索引在有效范围内
+    x_clipped = np.clip(x.astype(np.int32), 0, W - 1)
+    y_clipped = np.clip(y.astype(np.int32), 0, H - 1)
+    flow_vectors = data.flow_nhw2_unfiltered[i_frame - 1, y_clipped, x_clipped]  # 使用原始光流
+    stroke_after_flow = previous_flow_filtered_snapping + flow_vectors
+
+    # 第二步：使用过滤后的候选点进行吸附（禁用拓扑修复）
+    points_stroke_candidate_filtered = data.kd_tree.query_batch(
+        i_frame,
+        stroke_after_flow,
+        EdgeSnappingConfig.r_s,
+    )
+
+    # 获取前一帧的结果用于速度约束
+    previous_snapped_stroke = buffers.flow_filtered_snapping[i_frame - 1] if i > 0 else None
+    
+    # 禁用拓扑修复
+    original_topology_fix = EdgeSnappingConfig.enable_topology_fix
+    EdgeSnappingConfig.enable_topology_fix = False
+    
+    stroke_flow_filtered_snapping = local_snapping(
+        stroke_after_flow,
+        data.images_rgb[i_frame],
+        points_stroke_candidate_filtered,  # 使用过滤后的候选点
+        previous_snapped_stroke=previous_snapped_stroke,
+        original_stroke_length=data.original_stroke_length,
+    )
+    
+    # 恢复拓扑修复设置
+    EdgeSnappingConfig.enable_topology_fix = original_topology_fix
+    
+    return stroke_flow_filtered_snapping
 
 
 def generate_fitted_prediction(
@@ -1107,6 +1386,34 @@ def generate_prediction_strokes_subsequent(buffers: StrokeBuffers, data: StrokeD
             i_frame, i, stroke_copied, buffers, data, H, W
         )
         buffers.flow_snapped[i_frame] = stroke_flow_snapped
+
+        # 在每次local_snapping调用后立即清理GPU缓存，防止累积
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
+            if i_frame % 10 == 0:
+                torch.cuda.reset_peak_memory_stats()
+
+        # 生成dilated_flow_snapping预测结果
+        stroke_dilated_flow_snapping = generate_dilated_flow_snapping_prediction(
+            i_frame, i, stroke_copied, buffers, data, H, W
+        )
+        buffers.dilated_flow_snapping[i_frame] = stroke_dilated_flow_snapping
+
+        # 在每次local_snapping调用后立即清理GPU缓存，防止累积
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 每10帧重置一次GPU内存统计，可能有助于减少内存碎片化
+            if i_frame % 10 == 0:
+                torch.cuda.reset_peak_memory_stats()
+
+        # 生成flow_filtered_snapping预测结果
+        stroke_flow_filtered_snapping = generate_flow_filtered_snapping_prediction(
+            i_frame, i, stroke_copied, buffers, data, H, W
+        )
+        buffers.flow_filtered_snapping[i_frame] = stroke_flow_filtered_snapping
 
         # 在每次local_snapping调用后立即清理GPU缓存，防止累积
         if torch.cuda.is_available():
@@ -1227,6 +1534,14 @@ def draw_curves(canvas: np.ndarray, context: RuntimeContext) -> None:
     if stroke_flow_snapped is not None and state.show_flow_snapped:
         cv2.polylines(canvas, [stroke_flow_snapped.astype(np.int32)], False, rgb_to_bgr(COLOR_FLOW_SNAPPED), THICKNESS, lineType=cv2.LINE_AA)
 
+    stroke_dilated_flow_snapping = buffers.dilated_flow_snapping[state.current_frame]
+    if stroke_dilated_flow_snapping is not None and state.show_dilated_flow_snapping:
+        cv2.polylines(canvas, [stroke_dilated_flow_snapping.astype(np.int32)], False, rgb_to_bgr(COLOR_DILATED_FLOW_SNAPPING), THICKNESS, lineType=cv2.LINE_AA)
+
+    stroke_flow_filtered_snapping = buffers.flow_filtered_snapping[state.current_frame]
+    if stroke_flow_filtered_snapping is not None and state.show_flow_filtered_snapping:
+        cv2.polylines(canvas, [stroke_flow_filtered_snapping.astype(np.int32)], False, rgb_to_bgr(COLOR_FLOW_FILTERED_SNAPPING), THICKNESS, lineType=cv2.LINE_AA)
+
     stroke_fitted = buffers.fitted[state.current_frame]
     if stroke_fitted is not None and state.show_fitted:
         cv2.polylines(canvas, [stroke_fitted.astype(np.int32)], False, rgb_to_bgr(COLOR_FITTED), THICKNESS, lineType=cv2.LINE_AA)
@@ -1285,9 +1600,11 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
 
     stroke_categories = (
         ("fitted", buffers.fitted, COLOR_FITTED),
-        ("flow", buffers.flow, COLOR_FLOW),
-        ("snapping", buffers.snapping, COLOR_SNAPPING),
-        ("flow_snapped", buffers.flow_snapped, COLOR_FLOW_SNAPPED),
+        ("pure_flow", buffers.flow, COLOR_FLOW),
+        ("pure_snapping", buffers.snapping, COLOR_SNAPPING),
+        ("pure_flow_and_pure_snapping", buffers.flow_snapped, COLOR_FLOW_SNAPPED),
+        ("dilated_flow_and_pure_snapping", buffers.dilated_flow_snapping, COLOR_DILATED_FLOW_SNAPPING),
+        ("pure_flow_and_filtered_snapping", buffers.flow_filtered_snapping, COLOR_FLOW_FILTERED_SNAPPING),
     )
 
     for name, strokes, color_rgb in stroke_categories:
@@ -1360,19 +1677,19 @@ def build_runtime_context() -> RuntimeContext:
 
     images_rgb_nhwc_uint8 = read_images_batch(frame_image_paths, cv2.IMREAD_COLOR_RGB)
 
+    # 只读取一次原始光流缓存
     flow_tensor = read_optical_flow_cache(env)
-    flow_nhw2_float32 = flow_tensor.numpy()
-    print(f"Loaded optical flow cache (dilated): {flow_nhw2_float32.shape}, {flow_nhw2_float32.dtype}")
-
-    flow_tensor_unfiltered = read_optical_flow_cache_unfiltered(env)
-    flow_nhw2_unfiltered_float32 = flow_tensor_unfiltered.numpy()
-    print(f"Loaded optical flow cache (unfiltered): {flow_nhw2_unfiltered_float32.shape}, {flow_nhw2_unfiltered_float32.dtype}")
+    flow_nhw2_original = flow_tensor.numpy()
+    print(f"Loaded optical flow cache: {flow_nhw2_original.shape}, {flow_nhw2_original.dtype}")
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
 
     # 保存未过滤的候选点（用于纯光流和纯吸附）
     # 使用列表推导式深拷贝每个numpy数组
     points_all_candidates_unfiltered = [points.copy() for points in points_all_candidates]
+
+    # 初始化处理后的光流（默认使用原始光流）
+    flow_nhw2_for_fitted = flow_nhw2_original
 
     # 使用原始mask进行双重过滤：
     # 1. 腐蚀3个像素，过滤掉物体内部的点
@@ -1387,6 +1704,13 @@ def build_runtime_context() -> RuntimeContext:
         dilate_size = EdgeSnappingConfig.dilate_size
         flow_erode_size = EdgeSnappingConfig.flow_erode_size
         flow_dilate_size = EdgeSnappingConfig.flow_dilate_size
+
+        # 输出参数信息（帮助理解实际效果）
+        print(f"\n📊 Mask和光流处理参数:")
+        print(f"  erode_size (候选点过滤): {erode_size}px 厚度 (核: {erode_size * 2 + 1}x{erode_size * 2 + 1})")
+        print(f"  dilate_size (候选点过滤): {dilate_size}px 厚度 (核: {dilate_size * 2 + 1}x{dilate_size * 2 + 1})")
+        print(f"  flow_erode_size (光流截取): {flow_erode_size}px 厚度 (核: {flow_erode_size * 2 + 1}x{flow_erode_size * 2 + 1})")
+        print(f"  flow_dilate_size (光流膨胀): {flow_dilate_size}px 厚度 (核: {flow_dilate_size * 2 + 1}x{flow_dilate_size * 2 + 1})\n")
 
         # 收集所有mask用于可视化
         masks_eroded_for_flow_list = []
@@ -1428,27 +1752,33 @@ def build_runtime_context() -> RuntimeContext:
         generate_mask_original_images(env, masks_original)
         if masks_eroded_for_flow_list:
             masks_eroded_for_flow_array = np.array(masks_eroded_for_flow_list)
-            generate_mask_erode_images(env, masks_eroded_for_flow_array)
+            generate_mask_erode_images(env, masks_eroded_for_flow_array, masks_original)
         if masks_dilated_for_filter_list:
             masks_dilated_for_filter_array = np.array(masks_dilated_for_filter_list)
-            generate_mask_dilate_images(env, masks_dilated_for_filter_array)
+            generate_mask_dilate_images(env, masks_dilated_for_filter_array, masks_original)
+        
+        # 生成三合一对比图
+        if masks_eroded_for_flow_list and masks_dilated_for_filter_list:
+            generate_mask_triple_comparison(env, masks_original, 
+                                          masks_eroded_for_flow_array, 
+                                          masks_dilated_for_filter_array)
         
         # 特征点可视化
         generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
         generate_salient_filtered_images(env, points_all_candidates_filtered, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
         
-        # 光流可视化
-        generate_flow_original_images(env, flow_nhw2_unfiltered_float32)
+        # 光流处理和可视化
+        generate_flow_original_images(env, flow_nhw2_original)
         
         if masks_eroded_for_flow_list:
             # 1. 生成裁剪后的光流可视化（flow-crop-by-mask）
-            flow_cropped = generate_flow_crop_by_mask_images(env, flow_nhw2_unfiltered_float32, masks_eroded_for_flow_array)
+            flow_cropped = generate_flow_crop_by_mask_images(env, flow_nhw2_original, masks_eroded_for_flow_array)
             
             # 2. 对裁剪后的光流进行膨胀（flow-dilate-only）
             flow_dilated = generate_flow_dilate_only_images(env, flow_cropped, flow_dilate_size)
             
             # 3. 将膨胀后的光流覆盖回原始光流（flow-dilate-final）
-            flow_nhw2_float32 = generate_flow_dilate_final_images(env, flow_nhw2_unfiltered_float32, flow_dilated)
+            flow_nhw2_for_fitted = generate_flow_dilate_final_images(env, flow_nhw2_original, flow_dilated)
             
             print(f"\n✅ 光流处理完成: erode_size={flow_erode_size}, dilate_size={flow_dilate_size}")
         
@@ -1466,8 +1796,8 @@ def build_runtime_context() -> RuntimeContext:
 
     data = StrokeData(
         images_rgb=images_rgb_nhwc_uint8,
-        flow_nhw2=flow_nhw2_float32,  # 膨胀后的光流（用于fitted）
-        flow_nhw2_unfiltered=flow_nhw2_unfiltered_float32,  # 未膨胀的光流（用于flow和flow_snapped）
+        flow_nhw2=flow_nhw2_for_fitted,  # 处理后的光流（腐蚀+膨胀，用于fitted）
+        flow_nhw2_unfiltered=flow_nhw2_original,  # 原始光流（用于flow、flow_snapped、snapping）
         kd_tree=kd_tree_groups,
         kd_tree_unfiltered=kd_tree_groups_unfiltered,
     )
@@ -1509,25 +1839,37 @@ def main():
 
     @registry.register('z')
     def toggle_snapping_visibility() -> bool:
-        """z键：切换纯吸附结果（snapping）的显示"""
+        """z键：切换纯吸附结果（pure_snapping）的显示"""
         viewer.show_snapping = not viewer.show_snapping
         return False
 
     @registry.register('x')
     def toggle_flow_visibility() -> bool:
-        """x键：切换纯光流结果（flow）的显示"""
+        """x键：切换纯光流结果（pure_flow）的显示"""
         viewer.show_flow = not viewer.show_flow
         return False
 
     @registry.register('c')
     def toggle_flow_snapped_visibility() -> bool:
-        """c键：切换光流吸附结果（flow_snapped）的显示"""
+        """c键：切换纯光流+纯吸附结果（pure_flow_and_pure_snapping）的显示"""
         viewer.show_flow_snapped = not viewer.show_flow_snapped
         return False
 
     @registry.register('v')
+    def toggle_dilated_flow_snapping_visibility() -> bool:
+        """v键：切换膨胀光流+纯吸附结果（dilated_flow_and_pure_snapping）的显示"""
+        viewer.show_dilated_flow_snapping = not viewer.show_dilated_flow_snapping
+        return False
+
+    @registry.register('b')
+    def toggle_flow_filtered_snapping_visibility() -> bool:
+        """b键：切换纯光流+过滤吸附结果（pure_flow_and_filtered_snapping）的显示"""
+        viewer.show_flow_filtered_snapping = not viewer.show_flow_filtered_snapping
+        return False
+
+    @registry.register('n')
     def toggle_fitted_visibility() -> bool:
-        """v键：切换fitted结果的显示"""
+        """n键：切换fitted结果的显示"""
         viewer.show_fitted = not viewer.show_fitted
         return False
 
