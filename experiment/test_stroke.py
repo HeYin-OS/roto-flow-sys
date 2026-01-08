@@ -15,6 +15,7 @@ from utils.kd_tree import BatchKDTree
 from utils.yaml_reader import YamlUtil
 from utils.gif_writer import save_fixed_length_gif_from_bgr
 from utils.path_utils import build_project_paths as build_project_paths_from_utils, get_target_name
+from torchvision.utils import flow_to_image
 
 COLOR_ORIGIN = (255, 255, 0)  # Vivid Orange
 COLOR_FLOW = (200, 130, 255)  # Soft Lavender
@@ -70,9 +71,21 @@ class StrokeEnvironment:
 
     @property
     def salient_dir(self) -> Path:
-        """Directory used to dump candidate salient points for debugging."""
+        """Directory used to dump unfiltered candidate salient points for debugging."""
 
         return self.paths.result / "salient" / self.target_name
+
+    @property
+    def salient_filtered_dir(self) -> Path:
+        """Directory used to dump filtered candidate salient points for debugging."""
+
+        return self.paths.result / "salient-filtered" / self.target_name
+
+    @property
+    def flow_crop_by_erode_mask_dir(self) -> Path:
+        """Directory used to dump optical flow cropped by erode mask for debugging."""
+
+        return self.paths.result / "flow-crop-by-erode-mask" / self.target_name
 
     # @property
     # def salient_stroke_dir(self) -> Path:
@@ -360,7 +373,7 @@ def filter_points_by_mask(points: np.ndarray, mask: np.ndarray, keep_inside: boo
 
 
 def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[np.ndarray], height: int, width: int) -> None:
-    """Dump salient edge candidate maps for debugging or offline inspection."""
+    """Dump unfiltered salient edge candidate maps for debugging or offline inspection."""
 
     work_dir = env.salient_dir
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -371,11 +384,94 @@ def generate_salient_images(env: StrokeEnvironment, points_all_candidates: List[
             if file_path.is_file():
                 file_path.unlink()
     
-    for i_img in tqdm(range(len(points_all_candidates)), desc="Generating salient point images:", unit=" image(s)"):
+    for i_img in tqdm(range(len(points_all_candidates)), desc="Generating unfiltered salient point images:", unit=" image(s)"):
         canvas = np.zeros((height, width), np.uint8)
         canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
         file_path = work_dir / f"{i_img:03d}.png"
         cv2.imwrite(str(file_path), canvas)
+
+
+def generate_salient_filtered_images(env: StrokeEnvironment, points_all_candidates: List[np.ndarray], height: int, width: int) -> None:
+    """Dump filtered salient edge candidate maps for debugging or offline inspection."""
+
+    work_dir = env.salient_filtered_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    for i_img in tqdm(range(len(points_all_candidates)), desc="Generating filtered salient point images:", unit=" image(s)"):
+        canvas = np.zeros((height, width), np.uint8)
+        canvas[points_all_candidates[i_img][:, 1].astype(np.int32), points_all_candidates[i_img][:, 0].astype(np.int32)] = 255
+        file_path = work_dir / f"{i_img:03d}.png"
+        cv2.imwrite(str(file_path), canvas)
+
+
+def flow_to_rgb(flow: np.ndarray) -> np.ndarray:
+    """
+    将光流转换为RGB可视化图像（使用PyTorch的flow_to_image函数）
+    与compute_RAFT.py中的格式保持一致
+    
+    Args:
+        flow: 光流数组，形状为(H, W, 2)，值为[dx, dy]
+    
+    Returns:
+        RGB图像，形状为(H, W, 3)，值范围0-255
+    """
+    # 将numpy数组转换为torch tensor
+    # flow格式: (H, W, 2) -> 需要转换为 (2, H, W)
+    flow_tensor = torch.from_numpy(flow).float()
+    flow_tensor = flow_tensor.permute(2, 0, 1)  # (2, H, W)
+    
+    # 添加batch维度: (1, 2, H, W)
+    flow_tensor = flow_tensor.unsqueeze(0)
+    
+    # 使用torchvision的flow_to_image函数
+    # 返回形状: (1, 3, H, W)，值范围0-255
+    rgb_tensor = flow_to_image(flow_tensor)
+    
+    # 转换为numpy并调整维度: (1, 3, H, W) -> (1, H, W, 3) -> (H, W, 3)
+    rgb_tensor = rgb_tensor.permute(0, 2, 3, 1)  # (1, H, W, 3)
+    rgb = rgb_tensor.squeeze(0).cpu().numpy()  # (H, W, 3)
+    
+    return rgb.astype(np.uint8)
+
+
+def generate_flow_crop_by_erode_mask_images(env: StrokeEnvironment, flows: np.ndarray, masks_eroded: np.ndarray) -> None:
+    """Dump optical flow images cropped by eroded mask for debugging or offline inspection."""
+
+    work_dir = env.flow_crop_by_erode_mask_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    # 光流帧数是N-1帧，mask帧数是N帧
+    n_frames = min(flows.shape[0], masks_eroded.shape[0])
+    
+    for i in tqdm(range(n_frames), desc="Generating flow cropped by erode mask images:", unit=" image(s)"):
+        flow = flows[i]  # 形状: (H, W, 2)
+        # 使用第i帧的腐蚀mask（光流是从frame i到frame i+1）
+        mask_eroded = masks_eroded[i]
+        
+        # 将mask扩展到光流的通道维度
+        mask_3d = np.stack([mask_eroded, mask_eroded], axis=-1)  # (H, W, 2)
+        
+        # 应用mask（在mask外的地方设为0）
+        flow_masked = flow * mask_3d
+        
+        # 转换为RGB可视化
+        flow_rgb = flow_to_rgb(flow_masked)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:03d}.png"
+        cv2.imwrite(str(file_path), flow_rgb)
 
 
 # def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates: List[np.ndarray], height: int, width: int, i_frame: int) -> None:
@@ -959,6 +1055,9 @@ def build_runtime_context() -> RuntimeContext:
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
 
+    # 保存未过滤的候选点可视化到salient目录
+    generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+
     # 保存未过滤的候选点（用于纯光流和纯吸附）
     # 使用列表推导式深拷贝每个numpy数组
     points_all_candidates_unfiltered = [points.copy() for points in points_all_candidates]
@@ -974,14 +1073,22 @@ def build_runtime_context() -> RuntimeContext:
 
         erode_size = EdgeSnappingConfig.erode_size
         dilate_size = EdgeSnappingConfig.dilate_size
+        flow_erode_size = EdgeSnappingConfig.flow_erode_size
 
+        # 收集腐蚀后的masks，用于后续生成光流可视化（使用flow_erode_size）
+        masks_eroded_for_flow_list = []
         points_all_candidates_filtered = []
+        
         for i in tqdm(range(len(points_all_candidates)), desc="Filtering Salient Points", unit=" frame(s)"):
             if i < masks_original.shape[0]:
                 mask_original = masks_original[i]
 
-                # 对原始mask进行腐蚀（用于过滤内部点）
+                # 对原始mask进行腐蚀（用于过滤内部候选点，使用erode_size）
                 mask_eroded = erode_mask(mask_original, erode_size)
+                
+                # 对原始mask进行腐蚀（用于截取光流，使用flow_erode_size）
+                mask_eroded_for_flow = erode_mask(mask_original, flow_erode_size)
+                masks_eroded_for_flow_list.append(mask_eroded_for_flow)
 
                 # 对原始mask进行膨胀（用于过滤外部点）
                 mask_dilated = dilate_mask(mask_original, dilate_size)
@@ -998,13 +1105,20 @@ def build_runtime_context() -> RuntimeContext:
                 # 如果mask帧数不够，使用原始点
                 points_all_candidates_filtered.append(points_all_candidates[i])
 
+        # 保存过滤后的候选点可视化到salient-filtered目录
+        generate_salient_filtered_images(env, points_all_candidates_filtered, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+        
+        # 生成被erode mask截取的光流可视化（使用flow_erode_size腐蚀的mask）
+        if masks_eroded_for_flow_list:
+            masks_eroded_for_flow_array = np.array(masks_eroded_for_flow_list)
+            generate_flow_crop_by_erode_mask_images(env, flow_nhw2_unfiltered_float32, masks_eroded_for_flow_array)
+        
         points_all_candidates = points_all_candidates_filtered
         # print("✅ 点过滤完成")
     except ValueError as e:
         print(f"⚠️  警告: {e}")
         print("   将使用未过滤的点")
 
-    generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
     kd_tree_groups = BatchKDTree(points_all_candidates)
     # 为未过滤的候选点创建 kd_tree（用于纯光流和纯吸附）
     kd_tree_groups_unfiltered = BatchKDTree(points_all_candidates_unfiltered)

@@ -76,6 +76,7 @@ class EdgeSnappingConfig:
     # lambda_length = None  # 长度约束项的权重（控制整体polyline长度的变化）（已禁用）
     erode_size = None
     dilate_size = None
+    flow_erode_size = None  # 光流截取时Mask腐蚀的核大小
     export_crop_ratio = None  # PNG导出时的裁剪比例
 
     fdog_kernel = None
@@ -108,6 +109,7 @@ class EdgeSnappingConfig:
         # EdgeSnappingConfig.lambda_length = s.get('lambda_length', 0.2)  # 默认值0.2（已禁用）
         EdgeSnappingConfig.erode_size = s['erode_size']
         EdgeSnappingConfig.dilate_size = s['dilate_size']
+        EdgeSnappingConfig.flow_erode_size = s.get('flow_erode_size', s['erode_size'])  # 默认使用erode_size
         EdgeSnappingConfig.export_crop_ratio = s.get('export_crop_ratio', 1.0)  # 默认值1.0（不裁剪）
 
         EdgeSnappingConfig.isConfigInit = True
