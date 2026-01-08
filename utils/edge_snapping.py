@@ -78,6 +78,7 @@ class EdgeSnappingConfig:
     erode_size = None
     dilate_size = None
     flow_erode_size = None  # 光流截取时Mask腐蚀的核大小
+    flow_dilate_size = None  # 光流膨胀的核大小
     enable_topology_fix = None  # 是否启用拓扑检查和修复
     topology_fix_max_iterations = None  # 拓扑修复的最大迭代次数
     topology_fix_smoothing = None  # 拓扑修复的平滑强度
@@ -116,6 +117,7 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.erode_size = s['erode_size']
         EdgeSnappingConfig.dilate_size = s['dilate_size']
         EdgeSnappingConfig.flow_erode_size = s.get('flow_erode_size', s['erode_size'])  # 默认使用erode_size
+        EdgeSnappingConfig.flow_dilate_size = s.get('flow_dilate_size', 2)  # 默认膨胀2像素
         EdgeSnappingConfig.enable_topology_fix = s.get('enable_topology_fix', True)  # 默认启用拓扑修复
         EdgeSnappingConfig.topology_fix_max_iterations = s.get('topology_fix_max_iterations', 50)  # 默认50次迭代
         EdgeSnappingConfig.topology_fix_smoothing = s.get('topology_fix_smoothing', 0.3)  # 默认平滑系数0.3

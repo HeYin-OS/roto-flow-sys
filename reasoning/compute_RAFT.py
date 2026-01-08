@@ -100,15 +100,38 @@ def compute_optical_flow_vector_fields(images_np: np.ndarray):
 
 
 def write_rgb_flow_images(flow: Tensor):
-    flow_imgs = flow_to_image(flow.permute(0, 3, 1, 2))
-    flow_imgs_np = flow_imgs.permute(0, 2, 3, 1).cpu().numpy()
+    """
+    使用torchvision标准将光流批量转换为BGR图像并保存
+    
+    Args:
+        flow: 光流张量，形状为(N, H, W, 2)
+    """
+    # 转换为 (N, 2, H, W) 格式
+    flow_nchw = flow.permute(0, 3, 1, 2)
+    
+    # 使用torchvision的flow_to_image函数
+    # 返回形状: (N, 3, H, W)，值范围0-255，RGB格式
+    flow_imgs = flow_to_image(flow_nchw)
+    
+    # 转换为numpy: (N, 3, H, W) -> (N, H, W, 3)
+    flow_imgs_np = flow_imgs.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
 
     work_dir = DEBUG_DIR / "flow" / TARGET_NAME
     work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的旧文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
 
-    for i in tqdm(range(flow_imgs_np.shape[0]), desc="Writing RGB flow images:", unit="image"):
-        path = work_dir / f"frame_{i:02d}_to_{i + 1:02d}.jpg"
-        cv2.imwrite(str(path), flow_imgs_np[i])
+    for i in tqdm(range(flow_imgs_np.shape[0]), desc="Writing flow images (torchvision standard):", unit="image"):
+        # 转换为BGR格式（OpenCV保存格式）
+        bgr_img = cv2.cvtColor(flow_imgs_np[i], cv2.COLOR_RGB2BGR)
+        
+        # 统一使用PNG格式和5位填充的帧号
+        path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(path), bgr_img)
 
 
 if __name__ == "__main__":

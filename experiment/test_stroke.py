@@ -70,28 +70,62 @@ class StrokeEnvironment:
         return self.paths.cache / "mask" / f"{self.target_name}.pt"
 
     @property
-    def salient_dir(self) -> Path:
-        """Directory used to dump unfiltered candidate salient points for debugging."""
+    def intermediates_dir(self) -> Path:
+        """Base directory for all intermediate results."""
+        return self.paths.result / self.target_name / "intermediates"
 
-        return self.paths.result / "salient" / self.target_name
+    @property
+    def final_dir(self) -> Path:
+        """Base directory for final results."""
+        return self.paths.result / self.target_name / "final"
+
+    # === 光流相关中间结果 ===
+    @property
+    def flow_original_dir(self) -> Path:
+        """原始光流可视化（未经任何处理）"""
+        return self.intermediates_dir / "flow-original"
+
+    @property
+    def flow_crop_by_mask_dir(self) -> Path:
+        """被mask剪裁后的光流"""
+        return self.intermediates_dir / "flow-crop-by-mask"
+
+    @property
+    def flow_dilate_only_dir(self) -> Path:
+        """仅膨胀处理的光流（不含原始光流）"""
+        return self.intermediates_dir / "flow-dilate-only"
+
+    @property
+    def flow_dilate_final_dir(self) -> Path:
+        """最终合成的光流结果（膨胀+原始）"""
+        return self.intermediates_dir / "flow-dilate-final"
+
+    # === Mask相关中间结果 ===
+    @property
+    def mask_original_dir(self) -> Path:
+        """原始mask可视化"""
+        return self.intermediates_dir / "mask-original"
+
+    @property
+    def mask_erode_dir(self) -> Path:
+        """腐蚀后的mask（用于光流截取）"""
+        return self.intermediates_dir / "mask-erode"
+
+    @property
+    def mask_dilate_dir(self) -> Path:
+        """膨胀后的mask（用于过滤候选点）"""
+        return self.intermediates_dir / "mask-dilate"
+
+    # === 特征点相关中间结果 ===
+    @property
+    def salient_dir(self) -> Path:
+        """全部候选特征点"""
+        return self.intermediates_dir / "salient"
 
     @property
     def salient_filtered_dir(self) -> Path:
-        """Directory used to dump filtered candidate salient points for debugging."""
-
-        return self.paths.result / "salient-filtered" / self.target_name
-
-    @property
-    def flow_crop_by_erode_mask_dir(self) -> Path:
-        """Directory used to dump optical flow cropped by erode mask for debugging."""
-
-        return self.paths.result / "flow-crop-by-erode-mask" / self.target_name
-
-    # @property
-    # def salient_stroke_dir(self) -> Path:
-    #     """Directory used to dump salient stroke groups for debugging."""
-    #
-    #     return self.paths.result / "salient" / self.target_name
+        """过滤后的候选特征点"""
+        return self.intermediates_dir / "salient-filtered"
 
 
 @dataclass
@@ -410,16 +444,16 @@ def generate_salient_filtered_images(env: StrokeEnvironment, points_all_candidat
         cv2.imwrite(str(file_path), canvas)
 
 
-def flow_to_rgb(flow: np.ndarray) -> np.ndarray:
+def flow_to_bgr(flow: np.ndarray) -> np.ndarray:
     """
-    将光流转换为RGB可视化图像（使用PyTorch的flow_to_image函数）
-    与compute_RAFT.py中的格式保持一致
+    将光流转换为BGR可视化图像（使用torchvision的flow_to_image函数）
+    统一的光流可视化标准，输出BGR格式用于OpenCV保存
     
     Args:
         flow: 光流数组，形状为(H, W, 2)，值为[dx, dy]
     
     Returns:
-        RGB图像，形状为(H, W, 3)，值范围0-255
+        BGR图像，形状为(H, W, 3)，值范围0-255，uint8类型
     """
     # 将numpy数组转换为torch tensor
     # flow格式: (H, W, 2) -> 需要转换为 (2, H, W)
@@ -430,20 +464,153 @@ def flow_to_rgb(flow: np.ndarray) -> np.ndarray:
     flow_tensor = flow_tensor.unsqueeze(0)
     
     # 使用torchvision的flow_to_image函数
-    # 返回形状: (1, 3, H, W)，值范围0-255
+    # 返回形状: (1, 3, H, W)，值范围0-255，RGB格式
     rgb_tensor = flow_to_image(flow_tensor)
     
-    # 转换为numpy并调整维度: (1, 3, H, W) -> (1, H, W, 3) -> (H, W, 3)
-    rgb_tensor = rgb_tensor.permute(0, 2, 3, 1)  # (1, H, W, 3)
-    rgb = rgb_tensor.squeeze(0).cpu().numpy()  # (H, W, 3)
+    # 转换为numpy并调整维度: (1, 3, H, W) -> (H, W, 3)
+    rgb_np = rgb_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
+    rgb_np = rgb_np.astype(np.uint8)
     
-    return rgb.astype(np.uint8)
+    # 转换为BGR格式（OpenCV保存格式）
+    bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+    
+    return bgr_np
 
 
-def generate_flow_crop_by_erode_mask_images(env: StrokeEnvironment, flows: np.ndarray, masks_eroded: np.ndarray) -> None:
-    """Dump optical flow images cropped by eroded mask for debugging or offline inspection."""
+def generate_flow_original_images(env: StrokeEnvironment, flows: np.ndarray) -> None:
+    """
+    生成原始光流的可视化图像（未经任何处理）
+    
+    Args:
+        env: 环境配置
+        flows: 原始光流数组，形状为(N, H, W, 2)
+    """
+    work_dir = env.flow_original_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = flows.shape[0]
+    
+    for i in tqdm(range(n_frames), desc="Generating original flow images:", unit=" image(s)"):
+        flow = flows[i]  # 形状: (H, W, 2)
+        
+        # 转换为BGR可视化（使用统一的torchvision标准）
+        flow_bgr = flow_to_bgr(flow)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), flow_bgr)
 
-    work_dir = env.flow_crop_by_erode_mask_dir
+
+def generate_mask_original_images(env: StrokeEnvironment, masks: np.ndarray) -> None:
+    """
+    生成原始mask的可视化图像
+    
+    Args:
+        env: 环境配置
+        masks: 原始mask数组，形状为(N, H, W)，值为0-1
+    """
+    work_dir = env.mask_original_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = masks.shape[0]
+    
+    for i in tqdm(range(n_frames), desc="Generating original mask images:", unit=" image(s)"):
+        mask = masks[i]  # 形状: (H, W)
+        
+        # 转换为uint8 (0-255)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), mask_uint8)
+
+
+def generate_mask_erode_images(env: StrokeEnvironment, masks_eroded: np.ndarray) -> None:
+    """
+    生成腐蚀后mask的可视化图像
+    
+    Args:
+        env: 环境配置
+        masks_eroded: 腐蚀后的mask数组，形状为(N, H, W)，值为0-1
+    """
+    work_dir = env.mask_erode_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = masks_eroded.shape[0]
+    
+    for i in tqdm(range(n_frames), desc="Generating eroded mask images:", unit=" image(s)"):
+        mask = masks_eroded[i]  # 形状: (H, W)
+        
+        # 转换为uint8 (0-255)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), mask_uint8)
+
+
+def generate_mask_dilate_images(env: StrokeEnvironment, masks_dilated: np.ndarray) -> None:
+    """
+    生成膨胀后mask的可视化图像
+    
+    Args:
+        env: 环境配置
+        masks_dilated: 膨胀后的mask数组，形状为(N, H, W)，值为0-1
+    """
+    work_dir = env.mask_dilate_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = masks_dilated.shape[0]
+    
+    for i in tqdm(range(n_frames), desc="Generating dilated mask images:", unit=" image(s)"):
+        mask = masks_dilated[i]  # 形状: (H, W)
+        
+        # 转换为uint8 (0-255)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), mask_uint8)
+
+
+def generate_flow_crop_by_mask_images(env: StrokeEnvironment, flows: np.ndarray, masks_eroded: np.ndarray) -> np.ndarray:
+    """
+    生成被mask剪裁后的光流可视化图像
+    
+    Args:
+        env: 环境配置
+        flows: 原始光流数组，形状为(N, H, W, 2)
+        masks_eroded: 腐蚀后的mask数组，形状为(N, H, W)
+    
+    Returns:
+        flow_cropped: 裁剪后的光流数组，形状为(N, H, W, 2)
+    """
+
+    work_dir = env.flow_crop_by_mask_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     
     # 清空目录中的文件（不删除目录）
@@ -455,7 +622,10 @@ def generate_flow_crop_by_erode_mask_images(env: StrokeEnvironment, flows: np.nd
     # 光流帧数是N-1帧，mask帧数是N帧
     n_frames = min(flows.shape[0], masks_eroded.shape[0])
     
-    for i in tqdm(range(n_frames), desc="Generating flow cropped by erode mask images:", unit=" image(s)"):
+    # 创建裁剪后的光流数组
+    flow_cropped = np.zeros_like(flows[:n_frames])
+    
+    for i in tqdm(range(n_frames), desc="Generating flow cropped by mask images:", unit=" image(s)"):
         flow = flows[i]  # 形状: (H, W, 2)
         # 使用第i帧的腐蚀mask（光流是从frame i到frame i+1）
         mask_eroded = masks_eroded[i]
@@ -465,13 +635,158 @@ def generate_flow_crop_by_erode_mask_images(env: StrokeEnvironment, flows: np.nd
         
         # 应用mask（在mask外的地方设为0）
         flow_masked = flow * mask_3d
+        flow_cropped[i] = flow_masked
         
-        # 转换为RGB可视化
-        flow_rgb = flow_to_rgb(flow_masked)
+        # 转换为BGR可视化（使用统一的torchvision标准）
+        flow_bgr = flow_to_bgr(flow_masked)
         
         # 保存图像
-        file_path = work_dir / f"{i:03d}.png"
-        cv2.imwrite(str(file_path), flow_rgb)
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), flow_bgr)
+    
+    return flow_cropped
+
+
+def dilate_flow_binary(flow: np.ndarray, kernel_size: int) -> np.ndarray:
+    """
+    将光流按照二值对待进行膨胀
+    
+    Args:
+        flow: 光流数组，形状为(H, W, 2)，值为[dx, dy]
+        kernel_size: 膨胀核大小（像素宽度）
+    
+    Returns:
+        膨胀后的光流，形状为(H, W, 2)
+    """
+    if kernel_size <= 0:
+        return flow
+    
+    H, W = flow.shape[:2]
+    
+    # 创建二值mask：有光流的地方为1，无光流的地方为0
+    flow_magnitude = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
+    binary_mask = (flow_magnitude > 1e-6).astype(np.uint8)
+    
+    # 创建圆形结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size * 2 + 1, kernel_size * 2 + 1))
+    
+    # 对二值mask进行膨胀
+    dilated_mask = cv2.dilate(binary_mask, kernel, iterations=1)
+    
+    # 对于新膨胀出的区域，使用最近邻插值填充光流值
+    # 首先找到新膨胀出的区域
+    new_region = (dilated_mask > 0) & (binary_mask == 0)
+    
+    # 如果没有新区域，直接返回原光流
+    if not new_region.any():
+        return flow
+    
+    # 对于新区域的每个点，使用最近邻的有效光流值
+    # 使用距离变换找到最近的有效光流点
+    from scipy.ndimage import distance_transform_edt
+    
+    # 创建输出光流
+    flow_dilated = flow.copy()
+    
+    # 对x和y分量分别处理
+    for channel in range(2):
+        # 获取有效光流的mask
+        valid_mask = binary_mask > 0
+        
+        # 使用距离变换找到最近的有效点
+        indices = distance_transform_edt(~valid_mask, return_distances=False, return_indices=True)
+        
+        # 对新区域使用最近邻插值
+        flow_dilated[new_region, channel] = flow[indices[0][new_region], indices[1][new_region], channel]
+    
+    return flow_dilated
+
+
+def generate_flow_dilate_only_images(env: StrokeEnvironment, flows_cropped: np.ndarray, kernel_size: int) -> np.ndarray:
+    """
+    对裁剪后的光流进行膨胀，并生成可视化图像（仅显示膨胀部分）
+    
+    Args:
+        env: 环境配置
+        flows_cropped: 裁剪后的光流数组，形状为(N, H, W, 2)
+        kernel_size: 膨胀核大小
+    
+    Returns:
+        flow_dilated: 膨胀后的光流数组，形状为(N, H, W, 2)
+    """
+    work_dir = env.flow_dilate_only_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = flows_cropped.shape[0]
+    flow_dilated = np.zeros_like(flows_cropped)
+    
+    for i in tqdm(range(n_frames), desc=f"Generating dilated flow images (kernel_size={kernel_size}):", unit=" image(s)"):
+        flow = flows_cropped[i]  # 形状: (H, W, 2)
+        
+        # 对光流进行膨胀
+        flow_dilated_frame = dilate_flow_binary(flow, kernel_size)
+        flow_dilated[i] = flow_dilated_frame
+        
+        # 转换为BGR可视化（使用统一的torchvision标准）
+        flow_bgr = flow_to_bgr(flow_dilated_frame)
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), flow_bgr)
+    
+    return flow_dilated
+
+
+def generate_flow_dilate_final_images(env: StrokeEnvironment, flows_original: np.ndarray, flows_dilated: np.ndarray) -> np.ndarray:
+    """
+    将膨胀后的光流覆盖回原始光流，并生成可视化图像（最终合成结果）
+    
+    Args:
+        env: 环境配置
+        flows_original: 原始光流数组，形状为(N, H, W, 2)
+        flows_dilated: 膨胀后的光流数组，形状为(N, H, W, 2)
+    
+    Returns:
+        flow_final: 最终的光流数组，形状为(N, H, W, 2)
+    """
+    work_dir = env.flow_dilate_final_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空目录中的文件（不删除目录）
+    if work_dir.exists():
+        for file_path in work_dir.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+    
+    n_frames = min(flows_original.shape[0], flows_dilated.shape[0])
+    flow_final = flows_original[:n_frames].copy()
+    
+    for i in tqdm(range(n_frames), desc="Generating final dilated flow images:", unit=" image(s)"):
+        flow_orig = flows_original[i]  # 形状: (H, W, 2)
+        flow_dil = flows_dilated[i]  # 形状: (H, W, 2)
+        
+        # 创建mask：膨胀光流有值的地方
+        flow_dil_magnitude = np.sqrt(flow_dil[:, :, 0]**2 + flow_dil[:, :, 1]**2)
+        has_dilated_flow = flow_dil_magnitude > 1e-6
+        
+        # 将膨胀光流覆盖回原始光流（只在有值的地方覆盖）
+        mask_3d = np.stack([has_dilated_flow, has_dilated_flow], axis=-1)
+        flow_final[i] = np.where(mask_3d, flow_dil, flow_orig)
+        
+        # 转换为BGR可视化（使用统一的torchvision标准）
+        flow_bgr = flow_to_bgr(flow_final[i])
+        
+        # 保存图像
+        file_path = work_dir / f"{i:05d}.png"
+        cv2.imwrite(str(file_path), flow_bgr)
+    
+    return flow_final
 
 
 # def generate_salient_stroke_images(env: StrokeEnvironment, points_stroke_candidates: List[np.ndarray], height: int, width: int, i_frame: int) -> None:
@@ -926,13 +1241,13 @@ def propagate_current_stroke(context: RuntimeContext) -> None:
 
 
 def export_stroke_gifs(context: RuntimeContext) -> None:
-    """Export stroke propagation results to GIFs and JPG images grouped by stroke categories."""
+    """Export stroke propagation results to GIFs and PNG images grouped by stroke categories."""
 
     env = context.env
     data = context.data
     buffers = context.buffers
     n_frame = data.images_rgb.shape[0]
-    target_dir = env.paths.result / "final" / env.target_name
+    target_dir = env.final_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
     # 生成 input.png（第 0 帧的原始 stroke）
@@ -1055,9 +1370,6 @@ def build_runtime_context() -> RuntimeContext:
 
     points_all_candidates = compute_all_candidates(images_rgb_nhwc_uint8)
 
-    # 保存未过滤的候选点可视化到salient目录
-    generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
-
     # 保存未过滤的候选点（用于纯光流和纯吸附）
     # 使用列表推导式深拷贝每个numpy数组
     points_all_candidates_unfiltered = [points.copy() for points in points_all_candidates]
@@ -1074,12 +1386,14 @@ def build_runtime_context() -> RuntimeContext:
         erode_size = EdgeSnappingConfig.erode_size
         dilate_size = EdgeSnappingConfig.dilate_size
         flow_erode_size = EdgeSnappingConfig.flow_erode_size
+        flow_dilate_size = EdgeSnappingConfig.flow_dilate_size
 
-        # 收集腐蚀后的masks，用于后续生成光流可视化（使用flow_erode_size）
+        # 收集所有mask用于可视化
         masks_eroded_for_flow_list = []
+        masks_dilated_for_filter_list = []
         points_all_candidates_filtered = []
         
-        for i in tqdm(range(len(points_all_candidates)), desc="Filtering Salient Points", unit=" frame(s)"):
+        for i in tqdm(range(len(points_all_candidates)), desc="Processing Masks and Filtering Points", unit=" frame(s)"):
             if i < masks_original.shape[0]:
                 mask_original = masks_original[i]
 
@@ -1092,6 +1406,7 @@ def build_runtime_context() -> RuntimeContext:
 
                 # 对原始mask进行膨胀（用于过滤外部点）
                 mask_dilated = dilate_mask(mask_original, dilate_size)
+                masks_dilated_for_filter_list.append(mask_dilated)
 
                 # 第一步：使用腐蚀mask过滤掉物体内部的点（保留外部点）
                 points_after_erode = filter_points_by_mask(points_all_candidates[i], mask_eroded, keep_inside=False)
@@ -1100,18 +1415,44 @@ def build_runtime_context() -> RuntimeContext:
                 points_filtered = filter_points_by_mask(points_after_erode, mask_dilated, keep_inside=True)
 
                 points_all_candidates_filtered.append(points_filtered)
-                # print(f"  帧 {i}: {len(points_all_candidates[i])} -> {len(points_after_erode)} (腐蚀后) -> {len(points_filtered)} (最终) 个点")
             else:
                 # 如果mask帧数不够，使用原始点
                 points_all_candidates_filtered.append(points_all_candidates[i])
 
-        # 保存过滤后的候选点可视化到salient-filtered目录
-        generate_salient_filtered_images(env, points_all_candidates_filtered, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+        # === 生成所有中间结果可视化 ===
+        print("\n" + "=" * 60)
+        print("生成中间结果可视化...")
+        print("=" * 60)
         
-        # 生成被erode mask截取的光流可视化（使用flow_erode_size腐蚀的mask）
+        # Mask可视化
+        generate_mask_original_images(env, masks_original)
         if masks_eroded_for_flow_list:
             masks_eroded_for_flow_array = np.array(masks_eroded_for_flow_list)
-            generate_flow_crop_by_erode_mask_images(env, flow_nhw2_unfiltered_float32, masks_eroded_for_flow_array)
+            generate_mask_erode_images(env, masks_eroded_for_flow_array)
+        if masks_dilated_for_filter_list:
+            masks_dilated_for_filter_array = np.array(masks_dilated_for_filter_list)
+            generate_mask_dilate_images(env, masks_dilated_for_filter_array)
+        
+        # 特征点可视化
+        generate_salient_images(env, points_all_candidates, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+        generate_salient_filtered_images(env, points_all_candidates_filtered, images_rgb_nhwc_uint8.shape[1], images_rgb_nhwc_uint8.shape[2])
+        
+        # 光流可视化
+        generate_flow_original_images(env, flow_nhw2_unfiltered_float32)
+        
+        if masks_eroded_for_flow_list:
+            # 1. 生成裁剪后的光流可视化（flow-crop-by-mask）
+            flow_cropped = generate_flow_crop_by_mask_images(env, flow_nhw2_unfiltered_float32, masks_eroded_for_flow_array)
+            
+            # 2. 对裁剪后的光流进行膨胀（flow-dilate-only）
+            flow_dilated = generate_flow_dilate_only_images(env, flow_cropped, flow_dilate_size)
+            
+            # 3. 将膨胀后的光流覆盖回原始光流（flow-dilate-final）
+            flow_nhw2_float32 = generate_flow_dilate_final_images(env, flow_nhw2_unfiltered_float32, flow_dilated)
+            
+            print(f"\n✅ 光流处理完成: erode_size={flow_erode_size}, dilate_size={flow_dilate_size}")
+        
+        print("=" * 60 + "\n")
         
         points_all_candidates = points_all_candidates_filtered
         # print("✅ 点过滤完成")

@@ -32,7 +32,8 @@ snapping:
   # ========== Mask过滤参数 ==========
   erode_size: 2  # Mask腐蚀的核大小（像素），用于过滤物体内部的候选点
   dilate_size: 2  # Mask膨胀的核大小（像素），用于过滤物体外部的候选点
-  flow_erode_size: 0  # 光流截取时Mask腐蚀的核大小（像素），用于截取光流
+  flow_erode_size: 3  # 光流截取时Mask腐蚀的核大小（像素），用于截取光流
+  flow_dilate_size: 5  # 光流膨胀的核大小（像素），用于膨胀截取后的光流
   
   # ========== 导出参数 ==========
   export_crop_ratio: 0.4  # PNG导出时的裁剪比例，从中心裁剪（0.5表示裁剪0.5H*0.5W的区域）
