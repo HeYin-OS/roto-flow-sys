@@ -1569,9 +1569,9 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
     crop_ratio = EdgeSnappingConfig.export_crop_ratio if EdgeSnappingConfig.export_crop_ratio is not None else 1.0
     
-    # 获取偏移参数（默认为0，即中心位置）
-    offset_y_ratio = EdgeSnappingConfig.export_crop_offset_y if hasattr(EdgeSnappingConfig, 'export_crop_offset_y') else 0.0
-    offset_x_ratio = EdgeSnappingConfig.export_crop_offset_x if hasattr(EdgeSnappingConfig, 'export_crop_offset_x') else 0.0
+    # 获取偏移参数（已在配置文件中初始化，默认为0即中心位置）
+    offset_y_ratio = EdgeSnappingConfig.export_crop_offset_y
+    offset_x_ratio = EdgeSnappingConfig.export_crop_offset_x
     
     # 计算裁剪区域（从中心开始，然后应用偏移）
     crop_h = int(H * crop_ratio)

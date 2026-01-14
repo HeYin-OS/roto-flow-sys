@@ -84,6 +84,8 @@ class EdgeSnappingConfig:
     topology_fix_smoothing = None  # 拓扑修复的平滑强度
     max_stroke_points = None  # stroke的最大点数限制
     export_crop_ratio = None  # PNG导出时的裁剪比例
+    export_crop_offset_y = None  # PNG导出时的Y方向偏移比例
+    export_crop_offset_x = None  # PNG导出时的X方向偏移比例
 
     fdog_kernel = None
     gaussian_kernel = None
@@ -123,6 +125,8 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.topology_fix_smoothing = s.get('topology_fix_smoothing', 0.3)  # 默认平滑系数0.3
         EdgeSnappingConfig.max_stroke_points = s.get('max_stroke_points', 200)  # 默认最大200点
         EdgeSnappingConfig.export_crop_ratio = s.get('export_crop_ratio', 1.0)  # 默认值1.0（不裁剪）
+        EdgeSnappingConfig.export_crop_offset_y = s.get('export_crop_offset_y', 0.0)  # 默认值0.0（中心位置）
+        EdgeSnappingConfig.export_crop_offset_x = s.get('export_crop_offset_x', 0.0)  # 默认值0.0（中心位置）
 
         EdgeSnappingConfig.isConfigInit = True
 
