@@ -1569,13 +1569,45 @@ def export_stroke_gifs(context: RuntimeContext) -> None:
     H, W = data.images_rgb.shape[1], data.images_rgb.shape[2]
     crop_ratio = EdgeSnappingConfig.export_crop_ratio if EdgeSnappingConfig.export_crop_ratio is not None else 1.0
     
-    # 计算裁剪区域（从中心开始）
+    # 获取偏移参数（默认为0，即中心位置）
+    offset_y_ratio = EdgeSnappingConfig.export_crop_offset_y if hasattr(EdgeSnappingConfig, 'export_crop_offset_y') else 0.0
+    offset_x_ratio = EdgeSnappingConfig.export_crop_offset_x if hasattr(EdgeSnappingConfig, 'export_crop_offset_x') else 0.0
+    
+    # 计算裁剪区域（从中心开始，然后应用偏移）
     crop_h = int(H * crop_ratio)
     crop_w = int(W * crop_ratio)
-    start_y = (H - crop_h) // 2
-    start_x = (W - crop_w) // 2
+    
+    # 计算中心位置
+    center_y = H // 2
+    center_x = W // 2
+    
+    # 应用偏移（负数向上/向左，正数向下/向右）
+    offset_y = int(H * offset_y_ratio)
+    offset_x = int(W * offset_x_ratio)
+    
+    # 计算裁剪窗口的左上角（中心位置 - 半个窗口大小 + 偏移）
+    start_y = center_y - crop_h // 2 + offset_y
+    start_x = center_x - crop_w // 2 + offset_x
+    
+    # 边界检查，确保裁剪窗口不超出图像范围
+    start_y = max(0, min(start_y, H - crop_h))
+    start_x = max(0, min(start_x, W - crop_w))
+    
     end_y = start_y + crop_h
     end_x = start_x + crop_w
+    
+    # 输出裁剪窗口信息
+    print(f"\n{'='*60}")
+    print(f"PNG导出裁剪窗口配置:")
+    print(f"{'='*60}")
+    print(f"  图像尺寸: {H} x {W}")
+    print(f"  裁剪比例: {crop_ratio} ({crop_h} x {crop_w})")
+    print(f"  偏移比例: Y={offset_y_ratio:.2f}, X={offset_x_ratio:.2f}")
+    print(f"  偏移像素: Y={offset_y}px, X={offset_x}px")
+    print(f"  裁剪区域: Y[{start_y}:{end_y}], X[{start_x}:{end_x}]")
+    print(f"  中心位置: ({center_x}, {center_y})")
+    print(f"  裁剪中心: ({start_x + crop_w // 2}, {start_y + crop_h // 2})")
+    print(f"{'='*60}\n")
     
     # 生成第 0 帧的原始 stroke 图像
     background_input = cv2.cvtColor(data.images_rgb[0], cv2.COLOR_RGB2BGR)
