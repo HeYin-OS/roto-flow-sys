@@ -1552,7 +1552,46 @@ def propagate_current_stroke(context: RuntimeContext) -> None:
 
     stroke = context.strokes_library[context.viewer.current_stroke_index]
     propagate_strokes_with_snapping_flow(context.data, context.buffers, stroke)
+    export_stroke_npy_files(context)  # 新增：保存笔画数据为.npy文件
     export_stroke_gifs(context)
+
+
+def export_stroke_npy_files(context: RuntimeContext) -> None:
+    """Export stroke propagation results as .npy files grouped by strategy."""
+    
+    env = context.env
+    buffers = context.buffers
+    n_frame = context.data.images_rgb.shape[0]
+    
+    # 定义4组对比策略（是否膨胀光流 × 是否过滤点）
+    stroke_strategies = [
+        ("pure_flow_and_pure_snapping", buffers.flow_snapped),
+        ("dilated_flow_and_pure_snapping", buffers.dilated_flow_snapping),
+        ("pure_flow_and_filtered_snapping", buffers.flow_filtered_snapping),
+        ("fitted", buffers.fitted),
+    ]
+    
+    for strategy_name, strokes in stroke_strategies:
+        # 创建策略目录：results/[target]/strokes/[strategy]/
+        strategy_dir = env.paths.result / env.target_name / "strokes" / strategy_name
+        strategy_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 清空目录中的旧文件
+        if strategy_dir.exists():
+            for file_path in strategy_dir.iterdir():
+                if file_path.is_file() and file_path.suffix == '.npy':
+                    file_path.unlink()
+        
+        # 保存每一帧的笔画数据
+        for frame_idx in tqdm(range(n_frame), desc=f"Saving {strategy_name} .npy files", unit=" frame(s)"):
+            stroke_data = strokes[frame_idx]
+            if stroke_data is not None:
+                # 文件名格式：stroke_[frame:05d].npy
+                npy_filename = f"stroke_{frame_idx:05d}.npy"
+                npy_path = strategy_dir / npy_filename
+                
+                # 保存为numpy数组（形状：n*2，dtype：float32）
+                np.save(str(npy_path), stroke_data.astype(np.float32))
 
 
 def export_stroke_gifs(context: RuntimeContext) -> None:
